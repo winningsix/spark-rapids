@@ -129,6 +129,14 @@ case class GpuSortExec(
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val sorter = new GpuSorter(gpuSortOrder, output, allMetrics)
+    val rapidsConf = new RapidsConf(conf)
+    val sortKeyOnlyBoundaries = rapidsConf.sortKeyOnlyBoundaries
+    val prefixSortEnabled = rapidsConf.sortPrefixNormalizedKeyEnabled
+    val adaptiveCompressionEnabled = rapidsConf.sortAdaptiveSpillCompressionEnabled
+    val adaptiveCompressionThreshold = rapidsConf.sortAdaptiveSpillCompressionThreshold
+    // Cascade compression for device-host transfer during spill
+    val cascadeCompressionEnabled = rapidsConf.sortSpillCompressionEnabled
+    val cascadeCompressionCodec = rapidsConf.sortSpillCompressionCodec
 
     val sortTime = gpuLongMetric(SORT_TIME)
     val opTime = gpuLongMetric(OP_TIME_LEGACY)
@@ -136,13 +144,22 @@ case class GpuSortExec(
     val outputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val outOfCore = sortType == OutOfCoreSort
     val singleBatch = sortType == FullSortSingleBatch
+    // Prepare codec config for cascade compression (serializable)
+    val codecConfig = if (cascadeCompressionEnabled) {
+      Some(TableCompressionCodec.makeCodecConfig(rapidsConf))
+    } else {
+      None
+    }
     child.executeColumnar().mapPartitions { cbIter =>
       val taskTrackers = writeTrackers.map { tcs =>
         tcs.map(_.newTaskInstance().asInstanceOf[GpuWriteTaskStatsTracker])
       }
       val finalIter = if (outOfCore) {
         val iter = GpuOutOfCoreSortIterator(cbIter, sorter,
-          targetSize, opTime, sortTime, outputBatch, outputRows)
+          targetSize, opTime, sortTime, outputBatch, outputRows, 
+          sortKeyOnlyBoundaries, prefixSortEnabled, 
+          adaptiveCompressionEnabled, adaptiveCompressionThreshold,
+          cascadeCompressionEnabled, cascadeCompressionCodec, codecConfig)
         onTaskCompletion(iter.close())
         iter
       } else {
@@ -302,7 +319,14 @@ case class GpuOutOfCoreSortIterator(
     opTime: GpuMetric,
     sortTime: GpuMetric,
     outputBatches: GpuMetric,
-    outputRows: GpuMetric) extends Iterator[ColumnarBatch]
+    outputRows: GpuMetric,
+    sortKeyOnlyBoundaries: Boolean = true,
+    prefixSortEnabled: Boolean = false,
+    adaptiveCompressionEnabled: Boolean = false,
+    adaptiveCompressionThreshold: Double = 0.8,
+    cascadeCompressionEnabled: Boolean = false,
+    cascadeCompressionCodec: String = "LZ4",
+    codecConfig: Option[TableCompressionCodecConfig] = None) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
   /**
@@ -311,7 +335,12 @@ case class GpuOutOfCoreSortIterator(
    */
   val alreadySortedIter = GpuSpillableProjectedSortEachBatchIterator(iter, sorter, opTime, sortTime)
 
-  private val cpuOrd = new LazilyGeneratedOrdering(sorter.cpuOrdering)
+  // Use compact ordering when only copying sort key columns for boundary comparison
+  private val cpuOrd = if (sortKeyOnlyBoundaries) {
+    new LazilyGeneratedOrdering(sorter.compactCpuOrdering)
+  } else {
+    new LazilyGeneratedOrdering(sorter.cpuOrdering)
+  }
   // A priority queue of data that is not merged yet.
   private val pending = new Pending(cpuOrd)
 
@@ -330,19 +359,64 @@ case class GpuOutOfCoreSortIterator(
   private lazy val converters = new GpuRowToColumnConverter(
     TrampolineUtil.fromAttributes(sorter.projectedBatchSchema))
 
+  // Sort key only optimization: projection and converters for sort key columns only
+  private lazy val sortKeyUnsafeProjection = UnsafeProjection.create(sorter.sortKeyTypes)
+  private lazy val sortKeyConverters = new GpuRowToColumnConverter(
+    TrampolineUtil.fromAttributes(sorter.sortKeySchema))
+
+  /**
+   * Helper to create SpillableColumnarBatch with optional cascade compression.
+   * For data being spilled during out-of-core sort.
+   */
+  private def createSpillableBatch(
+      ct: ContiguousTable,
+      priority: Long): SpillableColumnarBatch = {
+    if (cascadeCompressionEnabled && codecConfig.isDefined) {
+      GpuSortCascadeCompression.compressAndCreateSpillable(
+        ct, sorter.projectedBatchTypes, priority, 
+        cascadeCompressionCodec, codecConfig.get)
+    } else {
+      SpillableColumnarBatch(ct, sorter.projectedBatchTypes, priority)
+    }
+  }
+
   /**
    * Convert the boundaries (first rows for each batch) into unsafe rows for use later on.
+   * When sortKeyOnlyBoundaries is enabled, only sort key columns are copied and converted,
+   * significantly reducing GPU-to-Host data transfer for wide tables.
    */
   private def convertBoundaries(tab: Table): Array[UnsafeRow] = {
     import scala.collection.JavaConverters._
-    val cb = NvtxRegistry.SORT_COPY_BOUNDARIES {
-      new ColumnarBatch(
-        GpuColumnVector.extractColumns(tab, sorter.projectedBatchTypes).map(_.copyToHost()),
-        tab.getRowCount.toInt)
-    }
-    withResource(cb) { cb =>
-      NvtxRegistry.SORT_TO_UNSAFE_ROW {
-        cb.rowIterator().asScala.map(unsafeProjection).map(_.copy().asInstanceOf[UnsafeRow]).toArray
+    if (sortKeyOnlyBoundaries) {
+      // Optimized path: only copy sort key columns from GPU to Host
+      val sortKeyIndices = sorter.sortKeyColumnIndices
+      val sortKeyTypes = sorter.sortKeyTypes
+      val cb = NvtxRegistry.SORT_COPY_BOUNDARIES {
+        val hostColumns: Array[org.apache.spark.sql.vectorized.ColumnVector] =
+          sortKeyIndices.zipWithIndex.map { case (colIdx, _) =>
+            GpuColumnVector.from(tab.getColumn(colIdx), sortKeyTypes(sortKeyIndices.indexOf(colIdx)))
+              .copyToHost()
+          }
+        new ColumnarBatch(hostColumns, tab.getRowCount.toInt)
+      }
+      withResource(cb) { cb =>
+        NvtxRegistry.SORT_TO_UNSAFE_ROW {
+          cb.rowIterator().asScala.map(sortKeyUnsafeProjection)
+            .map(_.copy().asInstanceOf[UnsafeRow]).toArray
+        }
+      }
+    } else {
+      // Original path: copy all columns
+      val cb = NvtxRegistry.SORT_COPY_BOUNDARIES {
+        new ColumnarBatch(
+          GpuColumnVector.extractColumns(tab, sorter.projectedBatchTypes).map(_.copyToHost()),
+          tab.getRowCount.toInt)
+      }
+      withResource(cb) { cb =>
+        NvtxRegistry.SORT_TO_UNSAFE_ROW {
+          cb.rowIterator().asScala.map(unsafeProjection)
+            .map(_.copy().asInstanceOf[UnsafeRow]).toArray
+        }
       }
     }
   }
@@ -414,9 +488,8 @@ case class GpuOutOfCoreSortIterator(
         val stillPending = if (hasFullySortedData) {
           val ct = splits(currentSplit)
           splits(currentSplit) = null
-          val sp = SpillableColumnarBatch(ct,
-            sorter.projectedBatchTypes,
-            SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
+          // First sorted batch - use cascade compression if enabled
+          val sp = createSpillableBatch(ct, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
           currentSplit += 1
           sortedCb = Some(sp)
           splits.slice(1, splits.length)
@@ -432,8 +505,8 @@ case class GpuOutOfCoreSortIterator(
                 splits(currentSplit) = null
                 currentSplit += 1
                 if (ct.getRowCount > 0) {
-                  val sp = SpillableColumnarBatch(ct, sorter.projectedBatchTypes,
-                    SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
+                  // Pending batches - use cascade compression if enabled (spill target)
+                  val sp = createSpillableBatch(ct, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
                   pendingObs += OutOfCoreBatch(sp, lower)
                 } else {
                   ct.close()
@@ -515,11 +588,24 @@ case class GpuOutOfCoreSortIterator(
           // The data is only fully sorted if there is nothing pending that is smaller than it
           // so get the next "smallest" row that is pending.
           val cutoff = pending.peek().firstRow
-          val result = RmmRapidsRetryIterator.withRetryNoSplit[ColumnVector] {
-            withResource(converters.convertBatch(Array(cutoff),
-              TrampolineUtil.fromAttributes(sorter.projectedBatchSchema))) { cutoffCb =>
-              withResource(mergedSpillBatch.getColumnarBatch()) { mergedBatch =>
-                sorter.upperBound(mergedBatch, cutoffCb)
+          val result = if (sortKeyOnlyBoundaries) {
+            // Optimized: use sort key only for upperBound computation
+            RmmRapidsRetryIterator.withRetryNoSplit[ColumnVector] {
+              withResource(sortKeyConverters.convertBatch(Array(cutoff),
+                TrampolineUtil.fromAttributes(sorter.sortKeySchema))) { cutoffCb =>
+                withResource(mergedSpillBatch.getColumnarBatch()) { mergedBatch =>
+                  sorter.sortKeyUpperBound(mergedBatch, cutoffCb)
+                }
+              }
+            }
+          } else {
+            // Original: use all columns for upperBound
+            RmmRapidsRetryIterator.withRetryNoSplit[ColumnVector] {
+              withResource(converters.convertBatch(Array(cutoff),
+                TrampolineUtil.fromAttributes(sorter.projectedBatchSchema))) { cutoffCb =>
+                withResource(mergedSpillBatch.getColumnarBatch()) { mergedBatch =>
+                  sorter.upperBound(mergedBatch, cutoffCb)
+                }
               }
             }
           }

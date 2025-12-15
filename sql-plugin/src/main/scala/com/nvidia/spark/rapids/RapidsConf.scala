@@ -784,6 +784,65 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .booleanConf
       .createWithDefault(false)
 
+  // Sort Optimization Configurations
+  val SORT_KEY_ONLY_BOUNDARIES = conf("spark.rapids.sql.sort.keyOnlyBoundaries.enabled")
+      .doc("Enable optimization that only copies sort key columns (not all columns) when " +
+          "computing boundaries for out-of-core sorting. This can significantly reduce GPU to " +
+          "Host data transfer and CPU serialization overhead when sorting tables with many " +
+          "value columns. The optimization applies to spill-heavy scenarios where boundary " +
+          "computation is a bottleneck.")
+      .booleanConf
+      .createWithDefault(true)
+
+  val SORT_SPILL_COMPRESSION_ENABLED = conf("spark.rapids.sql.sort.spillCompression.enabled")
+      .doc("Enable GPU-accelerated compression before spilling sort data to host memory. " +
+          "This can reduce memory bandwidth requirements and improve performance in spill-heavy " +
+          "scenarios at the cost of additional GPU computation for compression/decompression.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val SORT_SPILL_COMPRESSION_CODEC = conf("spark.rapids.sql.sort.spillCompression.codec")
+      .doc("Compression codec to use for sort spill compression. Supported values: " +
+          "LZ4 (fast, moderate compression), SNAPPY (balanced), ZSTD (high compression). " +
+          "LZ4 is recommended for most cases due to its speed.")
+      .stringConf
+      .createWithDefault("LZ4")
+
+  // PrefixSort Normalized Key Optimization
+  val SORT_PREFIX_NORMALIZED_KEY = conf("spark.rapids.sql.sort.prefixNormalizedKey.enabled")
+      .doc("Enable GPU-accelerated PrefixSort optimization that encodes multiple sort keys " +
+          "into a normalized binary format. This allows single-pass comparison instead of " +
+          "column-by-column comparison, which is particularly beneficial for multi-column " +
+          "sort keys (e.g., 3+ columns). The normalized key is used for initial sorting, " +
+          "with fallback to full comparison only when prefix ties occur. " +
+          "Inspired by Velox's PrefixSort optimization.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val SORT_PREFIX_KEY_LENGTH = conf("spark.rapids.sql.sort.prefixNormalizedKey.length")
+      .doc("Length in bytes of the normalized prefix key for PrefixSort optimization. " +
+          "Longer keys reduce tie-breaking overhead but increase memory usage. " +
+          "Recommended: 8-16 bytes for typical workloads.")
+      .integerConf
+      .createWithDefault(16)
+
+  // Adaptive Spill Compression Optimization  
+  val SORT_ADAPTIVE_SPILL_COMPRESSION = conf("spark.rapids.sql.sort.adaptiveSpillCompression.enabled")
+      .doc("Enable adaptive GPU-accelerated compression that automatically compresses data " +
+          "before spilling when memory pressure is detected. Unlike static spill compression, " +
+          "this adaptively decides compression based on spill frequency and data characteristics. " +
+          "Uses GPU LZ4 compression for fast encode/decode with moderate compression ratio.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val SORT_ADAPTIVE_SPILL_COMPRESSION_THRESHOLD = 
+      conf("spark.rapids.sql.sort.adaptiveSpillCompression.threshold")
+      .doc("Memory pressure threshold (0.0-1.0) to trigger adaptive compression. " +
+          "When GPU memory usage exceeds this fraction of allocated pool, " +
+          "compression will be applied to spill data. Default 0.8 (80% usage).")
+      .doubleConf
+      .createWithDefault(0.8)
+
   val FILE_SCAN_PRUNE_PARTITION_ENABLED = conf("spark.rapids.sql.fileScanPrunePartition.enabled")
     .doc("Enable or disable the partition column pruning for v1 file scan. Spark always asks " +
         "for all the partition columns even a query doesn't need them. Generation of " +
@@ -3180,6 +3239,21 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val sizedJoinPartitionAmplification: Double = get(SIZED_JOIN_PARTITION_AMPLIFICATION)
 
   lazy val stableSort: Boolean = get(STABLE_SORT)
+
+  lazy val sortKeyOnlyBoundaries: Boolean = get(SORT_KEY_ONLY_BOUNDARIES)
+
+  lazy val sortSpillCompressionEnabled: Boolean = get(SORT_SPILL_COMPRESSION_ENABLED)
+
+  lazy val sortSpillCompressionCodec: String = get(SORT_SPILL_COMPRESSION_CODEC)
+
+  lazy val sortPrefixNormalizedKeyEnabled: Boolean = get(SORT_PREFIX_NORMALIZED_KEY)
+
+  lazy val sortPrefixKeyLength: Int = get(SORT_PREFIX_KEY_LENGTH)
+
+  lazy val sortAdaptiveSpillCompressionEnabled: Boolean = get(SORT_ADAPTIVE_SPILL_COMPRESSION)
+
+  lazy val sortAdaptiveSpillCompressionThreshold: Double = 
+      get(SORT_ADAPTIVE_SPILL_COMPRESSION_THRESHOLD)
 
   lazy val isFileScanPrunePartitionEnabled: Boolean = get(FILE_SCAN_PRUNE_PARTITION_ENABLED)
 

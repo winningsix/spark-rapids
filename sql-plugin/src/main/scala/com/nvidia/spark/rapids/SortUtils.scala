@@ -92,17 +92,27 @@ class GpuSorter(
    */
   def cpuOrdering: Seq[SortOrder] = cpuOrderingInternal.toSeq
 
-  private[this] lazy val (sortOrdersThatNeedComputation, cudfOrdering, cpuOrderingInternal) = {
+  // Track sort ordering parameters for compactCudfOrdering generation
+  private case class SortKeyInfo(index: Int, isDescending: Boolean, isNullSmallest: Boolean)
+
+  private[this] lazy val (sortOrdersThatNeedComputation, cudfOrdering, cpuOrderingInternal,
+      sortKeyColumnIndicesInternal, sortKeyInfos) = {
     val sortOrdersThatNeedsComputation = mutable.ArrayBuffer[SortOrder]()
     val cpuOrdering = mutable.ArrayBuffer[SortOrder]()
     val cudfOrdering = mutable.ArrayBuffer[OrderByArg]()
+    val keyIndices = mutable.ArrayBuffer[Int]()  // Track sort key column indices
+    val keyInfos = mutable.ArrayBuffer[SortKeyInfo]()  // Track ordering info for compact ordering
     var newColumnIndex = numInputColumns
     // Remove duplicates in the ordering itself because
     // there is no need to do it twice.
     boundSortOrder.distinct.foreach { so =>
+      val isDesc = !so.isAscending
+      val isNullSmallest = so.nullOrdering == NullsFirst
       SortUtils.extractReference(so.child) match {
         case Some(ref) =>
           cudfOrdering += SortUtils.getOrder(so, ref.ordinal)
+          keyIndices += ref.ordinal  // Save sort key index
+          keyInfos += SortKeyInfo(ref.ordinal, isDesc, isNullSmallest)
           // It is a bound GPU reference so we have to translate it to the CPU
           cpuOrdering += SortOrder(
             BoundReference(ref.ordinal, ref.dataType, ref.nullable),
@@ -111,6 +121,8 @@ class GpuSorter(
           val index = newColumnIndex
           newColumnIndex += 1
           cudfOrdering += SortUtils.getOrder(so, index)
+          keyIndices += index  // Save computed sort key index
+          keyInfos += SortKeyInfo(index, isDesc, isNullSmallest)
           sortOrdersThatNeedsComputation += so
           // We already did the computation so instead of trying to translate
           // the computation back to the CPU too, just use the existing columns.
@@ -119,7 +131,51 @@ class GpuSorter(
             so.direction, so.nullOrdering, Seq.empty)
       }
     }
-    (sortOrdersThatNeedsComputation.toArray, cudfOrdering.toArray, cpuOrdering.toArray)
+    (sortOrdersThatNeedsComputation.toArray, cudfOrdering.toArray, cpuOrdering.toArray,
+        keyIndices.toArray, keyInfos.toArray)
+  }
+
+  /**
+   * The column indices in the projected batch that are used for sorting.
+   * These are the sort key columns.
+   */
+  lazy val sortKeyColumnIndices: Array[Int] = sortKeyColumnIndicesInternal
+
+  /**
+   * The data types of just the sort key columns.
+   */
+  lazy val sortKeyTypes: Array[DataType] = sortKeyColumnIndices.map(projectedBatchTypes(_))
+
+  /**
+   * The schema for just the sort key columns.
+   */
+  lazy val sortKeySchema: Seq[Attribute] = sortKeyColumnIndices.map(projectedBatchSchema(_))
+
+  /**
+   * CPU ordering for sort key columns only, with consecutive indices starting from 0.
+   * This is used when comparing UnsafeRows that contain only the sort key columns.
+   */
+  lazy val compactCpuOrdering: Seq[SortOrder] = {
+    cpuOrderingInternal.zipWithIndex.map { case (so, newIdx) =>
+      val oldRef = so.child.asInstanceOf[BoundReference]
+      SortOrder(
+        BoundReference(newIdx, oldRef.dataType, oldRef.nullable),
+        so.direction, so.nullOrdering, Seq.empty)
+    }
+  }
+
+  /**
+   * cuDF ordering for operations on sort-key-only tables.
+   * Uses consecutive indices 0, 1, 2, ... for the columns.
+   */
+  lazy val compactCudfOrdering: Array[OrderByArg] = {
+    sortKeyInfos.zipWithIndex.map { case (info, newIdx) =>
+      if (info.isDescending) {
+        OrderByArg.desc(newIdx, info.isNullSmallest)
+      } else {
+        OrderByArg.asc(newIdx, info.isNullSmallest)
+      }
+    }
   }
 
   /**
@@ -173,6 +229,29 @@ class GpuSorter(
     withResource(GpuColumnVector.from(findIn)) { findInTbl =>
       withResource(GpuColumnVector.from(find)) { findTbl =>
         findInTbl.upperBound(findTbl, cudfOrdering: _*)
+      }
+    }
+  }
+
+  /**
+   * Find the upper bounds using only the sort key columns. The findIn batch should be a full
+   * projected batch, but only the sort key columns will be extracted for comparison.
+   * The find batch should contain only sort key columns with consecutive indices.
+   * This is an optimization to reduce GPU-to-Host data transfer when only sort keys are needed.
+   * @param findIn the full data batch to search in (will extract sort key columns)
+   * @param find the sort-key-only batch to find upper bounds for
+   * @return the rows where the insertions would happen.
+   */
+  def sortKeyUpperBound(findIn: ColumnarBatch, find: ColumnarBatch): ColumnVector = {
+    // Extract only sort key columns from the full batch for GPU comparison
+    val sortKeyColumns = sortKeyColumnIndices.map { idx =>
+      findIn.column(idx).asInstanceOf[GpuColumnVector].getBase.incRefCount()
+    }
+    withResource(sortKeyColumns) { cols =>
+      withResource(new Table(cols: _*)) { findInKeysTbl =>
+        withResource(GpuColumnVector.from(find)) { findTbl =>
+          findInKeysTbl.upperBound(findTbl, compactCudfOrdering: _*)
+        }
       }
     }
   }

@@ -1951,6 +1951,18 @@ This will force full Scala code rebuild in downstream modules.
         </plugins>
     </build>
     <repositories>
+        <!-- NVIDIA URM Repository - primary source for NVIDIA SNAPSHOT dependencies -->
+        <repository>
+            <id>nvidia-urm</id>
+            <url>https://urm.nvidia.com/artifactory/sw-spark-maven/</url>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>true</enabled>
+                <updatePolicy>daily</updatePolicy>
+            </snapshots>
+        </repository>
         <repository>
             <id>snapshots-repo</id>
             <url>https://central.sonatype.com/repository/maven-snapshots/</url>
