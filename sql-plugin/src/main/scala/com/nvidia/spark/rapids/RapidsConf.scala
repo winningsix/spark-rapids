@@ -1444,6 +1444,15 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(true)
 
+  val SUBQUERY_MERGE_ENABLED =
+    conf("spark.rapids.sql.optimizer.subqueryMerge.enabled")
+    .doc("When enabled, attempts to merge subqueries that access the same tables as the main " +
+      "query into a single scan. This is particularly effective for TPC-H style queries like " +
+      "Q11 (HAVING with scalar subquery) and Q17 (correlated subquery on same table). " +
+      "The optimization reduces I/O by avoiding redundant table scans.")
+    .booleanConf
+    .createWithDefault(false)  // Experimental, default off
+
   val ENABLE_ORC = conf("spark.rapids.sql.format.orc.enabled")
     .doc("When set to false disables all orc input and output acceleration")
     .booleanConf
