@@ -1107,6 +1107,91 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(true)
 
+  val ENABLE_BATCHED_AGGREGATE = conf("spark.rapids.sql.batchedAggregate.enabled")
+    .doc("Enable batched aggregate optimization for queries with many aggregation columns. " +
+      "This reduces memory fragmentation by using a shared output buffer.")
+    .booleanConf
+    .createWithDefault(false)
+
+  val BATCHED_AGGREGATE_MIN_COLUMNS = conf("spark.rapids.sql.batchedAggregate.minColumns")
+    .doc("Minimum number of aggregation columns to trigger batched aggregate optimization.")
+    .integerConf
+    .createWithDefault(10)
+
+  val BATCHED_AGGREGATE_WARP_REDUCTION = conf("spark.rapids.sql.batchedAggregate.warpReduction")
+    .doc("Enable warp-level reduction optimization for batched aggregate. " +
+      "This reduces atomic operations by 32x when threads in a warp belong to the same group.")
+    .booleanConf
+    .createWithDefault(true)
+
+  val BATCHED_AGGREGATE_CONTIGUOUS_OUTPUT = conf("spark.rapids.sql.batchedAggregate.contiguousOutput")
+    .doc("Enable contiguous output buffer optimization for batched aggregate. " +
+      "This reduces memory allocations from N to 1 by using a single shared buffer.")
+    .booleanConf
+    .createWithDefault(true)
+
+  val BATCHED_AGGREGATE_SHARED_GROUPBY = conf("spark.rapids.sql.batchedAggregate.sharedGroupby")
+    .doc("Enable shared groupby optimization for batched aggregate. " +
+      "This reuses get_groups() result across all aggregation columns, eliminating N-1 hash computations.")
+    .booleanConf
+    .createWithDefault(true)
+
+  val BATCHED_AGGREGATE_PERFECT_HASH = conf("spark.rapids.sql.batchedAggregate.perfectHash")
+    .doc("Enable perfect hash optimization for batched aggregate. " +
+      "When keys are small integers, uses direct key-as-index for O(1) group lookup.")
+    .booleanConf
+    .createWithDefault(true)
+
+  val BATCHED_AGGREGATE_PERFECT_HASH_MAX_KEYS = conf("spark.rapids.sql.batchedAggregate.perfectHashMaxKeys")
+    .doc("Maximum number of unique keys to enable perfect hash optimization. " +
+      "Keys beyond this threshold will use standard hash-based groupby.")
+    .integerConf
+    .createWithDefault(1000000)
+
+  val BATCHED_AGGREGATE_ADAPTIVE = conf("spark.rapids.sql.batchedAggregate.adaptive")
+    .doc("Enable adaptive strategy selection for batched aggregate. " +
+      "Automatically selects the best execution strategy based on data characteristics.")
+    .booleanConf
+    .createWithDefault(true)
+
+  // ============================================================================
+  // Fused Transform + Aggregate Configuration
+  // Fuses Project expressions with HashAggregate in a single GPU kernel
+  // ============================================================================
+
+  val ENABLE_FUSED_TRANSFORM_AGGREGATE = conf("spark.rapids.sql.fusedTransformAggregate.enabled")
+    .doc("Enable fused transform + aggregate optimization. " +
+      "This fuses Project expressions (like coalesce, if-else, arithmetic) with HashAggregate " +
+      "in a single GPU kernel, eliminating intermediate memory allocation and reducing " +
+      "memory bandwidth. Most effective for queries with many aggregate columns (130+). " +
+      "Main benefits: single memory allocation, single group computation, multi-column fusion.")
+    .booleanConf
+    .createWithDefault(true)
+
+  val FUSED_TRANSFORM_AGGREGATE_MIN_COLUMNS = 
+    conf("spark.rapids.sql.fusedTransformAggregate.minColumns")
+    .doc("Minimum number of aggregation columns to trigger fused transform aggregate. " +
+      "Lower values enable fusion for smaller queries. The main benefit comes from " +
+      "reducing RMM allocations and groupby computations, proportional to column count.")
+    .integerConf
+    .createWithDefault(4)
+
+  val FUSED_TRANSFORM_AGGREGATE_WARP_REDUCTION =
+    conf("spark.rapids.sql.fusedTransformAggregate.warpReduction")
+    .doc("Enable warp-level reduction in fused transform aggregate kernel. " +
+      "Note: Benchmarks show this provides no benefit for random group distributions. " +
+      "Only enable if data is pre-sorted by group key (e.g., after SortMergeJoin).")
+    .booleanConf
+    .createWithDefault(false)
+
+  val FUSED_TRANSFORM_AGGREGATE_FALLBACK_ON_OOM =
+    conf("spark.rapids.sql.fusedTransformAggregate.fallbackOnOOM")
+    .doc("When OOM occurs during fused transform aggregate, fall back to standard " +
+      "Project + HashAggregate execution instead of failing. This provides graceful " +
+      "degradation when GPU memory is limited.")
+    .booleanConf
+    .createWithDefault(true)
+
   val ENABLE_CAST_FLOAT_TO_DECIMAL = conf("spark.rapids.sql.castFloatToDecimal.enabled")
     .doc("Casting from floating point types to decimal on the GPU returns results that have " +
       "tiny difference compared to results returned from CPU.")
@@ -1216,6 +1301,20 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .internal()
       .booleanConf
       .createWithDefault(true)
+
+  val ENABLE_AST_BATCH_PROJECT = conf("spark.rapids.sql.aggregate.astBatchProject.enabled")
+      .doc("Enable AST batch compilation for pre-project expressions in aggregation. " +
+        "This batches multiple AST-compatible expressions into fewer kernel launches, " +
+        "which is particularly effective for workloads with many aggregations like " +
+        "variance/covariance calculations.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val AST_BATCH_PROJECT_MIN_EXPRESSIONS = conf("spark.rapids.sql.aggregate.astBatchProject.minExpressions")
+      .doc("Minimum number of AST-compatible expressions required to enable AST batch compilation. " +
+        "Below this threshold, traditional expression evaluation is used.")
+      .integerConf
+      .createWithDefault(10)
 
   val ENABLE_COMBINED_EXPR_PREFIX = "spark.rapids.sql.expression.combined."
 
@@ -1510,6 +1609,16 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
 
   val ENABLE_ORC_READ = conf("spark.rapids.sql.format.orc.read.enabled")
     .doc("When set to false disables orc input acceleration")
+    .booleanConf
+    .createWithDefault(true)
+
+  val ENABLE_PROTOBUF = conf("spark.rapids.sql.format.protobuf.enabled")
+    .doc("When set to false disables all protobuf input acceleration")
+    .booleanConf
+    .createWithDefault(true)
+
+  val ENABLE_PROTOBUF_READ = conf("spark.rapids.sql.format.protobuf.read.enabled")
+    .doc("When set to false disables protobuf input acceleration")
     .booleanConf
     .createWithDefault(true)
 
@@ -3433,6 +3542,33 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val enableFoldLocalAggregate: Boolean = get(ENABLE_FOLD_LOCAL_AGGREGATE)
 
+  lazy val enableBatchedAggregate: Boolean = get(ENABLE_BATCHED_AGGREGATE)
+
+  lazy val batchedAggregateMinColumns: Int = get(BATCHED_AGGREGATE_MIN_COLUMNS)
+
+  lazy val batchedAggregateWarpReduction: Boolean = get(BATCHED_AGGREGATE_WARP_REDUCTION)
+
+  lazy val batchedAggregateContiguousOutput: Boolean = get(BATCHED_AGGREGATE_CONTIGUOUS_OUTPUT)
+
+  lazy val batchedAggregateSharedGroupby: Boolean = get(BATCHED_AGGREGATE_SHARED_GROUPBY)
+
+  lazy val batchedAggregatePerfectHash: Boolean = get(BATCHED_AGGREGATE_PERFECT_HASH)
+
+  lazy val batchedAggregatePerfectHashMaxKeys: Int = get(BATCHED_AGGREGATE_PERFECT_HASH_MAX_KEYS)
+
+  lazy val batchedAggregateAdaptive: Boolean = get(BATCHED_AGGREGATE_ADAPTIVE)
+
+  // Fused Transform + Aggregate configuration getters
+  lazy val enableFusedTransformAggregate: Boolean = get(ENABLE_FUSED_TRANSFORM_AGGREGATE)
+
+  lazy val fusedTransformAggregateMinColumns: Int = get(FUSED_TRANSFORM_AGGREGATE_MIN_COLUMNS)
+
+  lazy val fusedTransformAggregateWarpReduction: Boolean = 
+    get(FUSED_TRANSFORM_AGGREGATE_WARP_REDUCTION)
+
+  lazy val fusedTransformAggregateFallbackOnOOM: Boolean = 
+    get(FUSED_TRANSFORM_AGGREGATE_FALLBACK_ON_OOM)
+
   lazy val areInnerJoinsEnabled: Boolean = get(ENABLE_INNER_JOIN)
 
   lazy val areCrossJoinsEnabled: Boolean = get(ENABLE_CROSS_JOIN)
@@ -3468,6 +3604,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val isProjectAstEnabled: Boolean = get(ENABLE_PROJECT_AST)
 
   lazy val isTieredProjectEnabled: Boolean = get(ENABLE_TIERED_PROJECT)
+
+  lazy val isAstBatchProjectEnabled: Boolean = get(ENABLE_AST_BATCH_PROJECT)
+
+  lazy val astBatchProjectMinExpressions: Int = get(AST_BATCH_PROJECT_MIN_EXPRESSIONS)
 
   lazy val isCombinedExpressionsEnabled: Boolean = get(ENABLE_COMBINED_EXPRESSIONS)
 
@@ -3581,6 +3721,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val orcReadIgnoreWriterTimezone: Boolean = get(ORC_READ_IGNORE_WRITE_TIMEZONE)
 
   lazy val isOrcBoolTypeEnabled: Boolean = get(ENABLE_ORC_BOOL)
+
+  lazy val isProtobufEnabled: Boolean = get(ENABLE_PROTOBUF)
+
+  lazy val isProtobufReadEnabled: Boolean = get(ENABLE_PROTOBUF_READ)
 
   lazy val isCsvEnabled: Boolean = get(ENABLE_CSV)
 

@@ -1978,7 +1978,8 @@ case class GpuHashAggregateExec(
     "NUM_AGGS" -> createMetric(DEBUG_LEVEL, "num agg operations"),
     "NUM_PRE_SPLITS" -> createMetric(DEBUG_LEVEL, "num pre splits"),
     "NUM_TASKS_SINGLE_PASS" -> createMetric(MODERATE_LEVEL, "number of single pass tasks"),
-    "HEURISTIC_TIME" -> createNanoTimingMetric(DEBUG_LEVEL, "time in heuristic")
+    "HEURISTIC_TIME" -> createNanoTimingMetric(DEBUG_LEVEL, "time in heuristic"),
+    "NUM_FUSED_BATCHES" -> createMetric(MODERATE_LEVEL, "batches processed by fused kernel")
   )
 
   // requiredChildDistributions are CPU expressions, so remove it from the GPU expressions list
@@ -1998,6 +1999,15 @@ case class GpuHashAggregateExec(
   }
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
+    // #region agent log - entry point
+    try {
+      val debugLogPath = "/home/ferdinandx/code/parallel/.cursor/debug.log"
+      val fw = new java.io.FileWriter(debugLogPath, true)
+      fw.write(s"""{"hypothesisId":"ENTRY","location":"GpuAggregateExec.scala:internalDoExecuteColumnar","message":"Method called","data":{"childType":"${child.getClass.getSimpleName}","aggCount":"${aggregateExpressions.size}"},"timestamp":${System.currentTimeMillis()},"sessionId":"debug-session"}\n""")
+      fw.close()
+    } catch { case _: Exception => }
+    // #endregion
+    
     val aggMetrics = GpuHashAggregateMetrics(
       numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS),
       numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES),
@@ -2022,6 +2032,63 @@ case class GpuHashAggregateExec(
     val modeInfo = AggregateModeInfo(uniqueModes)
     val targetBatchSize = configuredTargetBatchSize
 
+    // Check if fused Project+Aggregate should be attempted
+    val rapidsConf = new RapidsConf(conf)
+    val (useFusion, projectExprs, projectInputAttrs) = 
+      GpuFusedProjectAggregate.checkSeparateProjectFusion(
+        rapidsConf, child, aggregateExprs, modeInfo)
+
+    // #region agent log - hypothesis FUSION
+    def debugLog(hyp: String, msg: String, data: String): Unit = {
+      try {
+        val fw = new java.io.FileWriter("/home/ferdinandx/code/parallel/.cursor/debug.log", true)
+        fw.write(s"""{"hypothesisId":"$hyp","location":"GpuAggregateExec.scala:internalDoExecuteColumnar","message":"$msg","data":$data,"timestamp":${System.currentTimeMillis()},"sessionId":"debug-session"}\n""")
+        fw.close()
+      } catch { case _: Exception => }
+    }
+    debugLog("FUSION", "Fusion decision", s"""{"useFusion":$useFusion,"projectExprsSize":${projectExprs.size},"aggregateExprsSize":${aggregateExprs.size},"childType":"${child.getClass.getSimpleName}"}""")
+    // #endregion
+
+    if (useFusion) {
+      // Fused path: execute Project + Aggregate together
+      logWarning(s"[FUSION] Using fused Project+Aggregate path with " +
+        s"${projectExprs.size} project expressions and ${aggregateExprs.size} aggregates")
+      
+      debugLog("FUSION", "Taking fused path", s"""{"projectExprsSize":${projectExprs.size},"aggregateExprsSize":${aggregateExprs.size}}""")
+      
+      // Get the RDD from Project's child (skip the Project)
+      val projectChild = child.asInstanceOf[GpuProjectExec].child
+      val rdd = projectChild.executeColumnar()
+      
+      // Localize ALL variables to avoid closure serialization issues (NPE in ClosureCleaner)
+      val localProjectExprs = projectExprs
+      val localProjectInputAttrs = projectInputAttrs
+      val localGroupingExprs = groupingExprs
+      val localAggregateExprs = aggregateExprs
+      val localAggregateAttrs = aggregateAttrs
+      val localResultExprs = resultExprs
+      val localModeInfo = modeInfo
+      val localAggMetrics = aggMetrics
+      val localEnableWarpReduction = rapidsConf.fusedTransformAggregateWarpReduction
+      val localAllMetrics = allMetrics
+      
+      rdd.mapPartitions { cbIter =>
+        new GpuFusedProjectAggregateIterator(
+          cbIter,
+          localProjectExprs,
+          localGroupingExprs,
+          localAggregateExprs,
+          localAggregateAttrs,
+          localResultExprs,
+          localProjectInputAttrs,
+          localModeInfo,
+          localAggMetrics,
+          localEnableWarpReduction,
+          localAllMetrics
+        )
+      }
+    } else {
+      // Standard path: use existing DynamicGpuPartialAggregateIterator
     val rdd = child.executeColumnar()
 
     val localForcePre = forceSinglePassAgg
@@ -2045,6 +2112,7 @@ case class GpuHashAggregateExec(
         localForcePre, localAllowPre, allowNonFullyAggregatedOutput, skipAggPassReductionRatio,
         allMetrics
       )
+      }
     }
   }
 
