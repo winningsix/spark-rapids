@@ -1453,6 +1453,37 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(false)  // Experimental, default off
 
+  // ============================================================================
+  // Late Materialization / Fused Operators Configuration
+  // ============================================================================
+
+  val FUSED_OPERATORS_ENABLED =
+    conf("spark.rapids.sql.optimizer.fusedOperators.enabled")
+    .doc("When enabled, fuses consecutive Filter and Project operators into a single " +
+      "GpuFusedFilterProjectExec operator using cuDF AST. This implements 'Late Materialization' " +
+      "optimization similar to Velox's JIT approach. Benefits include: reduced intermediate " +
+      "materialization, eliminated GPU kernel launch overhead, and better memory bandwidth " +
+      "utilization. Particularly effective for TPC-H Q6 style queries (scan + filter + project + " +
+      "aggregate). Requires expressions to be AST-compatible.")
+    .booleanConf
+    .createWithDefault(false)  // Experimental, default off
+
+  val FUSED_AGGREGATE_ENABLED =
+    conf("spark.rapids.sql.optimizer.fusedAggregate.enabled")
+    .doc("When enabled, extends fused operators to include aggregation. This is Phase 2 of " +
+      "Late Materialization optimization, fusing Filter + Project + Aggregate into a single " +
+      "execution path. More aggressive than fusedOperators, requires JIT kernel compilation.")
+    .booleanConf
+    .createWithDefault(false)  // Experimental, default off
+
+  val FUSED_OPERATORS_MIN_BATCH_ROWS =
+    conf("spark.rapids.sql.optimizer.fusedOperators.minBatchRows")
+    .doc("Minimum number of rows in a batch to enable fused operator execution. " +
+      "Fusion has overhead for small batches, so we only fuse when batch size exceeds " +
+      "this threshold. Set to 0 to always fuse.")
+    .integerConf
+    .createWithDefault(10000)
+
   val ENABLE_ORC = conf("spark.rapids.sql.format.orc.enabled")
     .doc("When set to false disables all orc input and output acceleration")
     .booleanConf
@@ -3725,6 +3756,11 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   }
 
   lazy val allowDisableEntirePlan: Boolean = get(ALLOW_DISABLE_ENTIRE_PLAN)
+
+  // Late Materialization / Fused Operators accessors
+  lazy val fusedOperatorsEnabled: Boolean = get(FUSED_OPERATORS_ENABLED)
+  lazy val fusedAggregateEnabled: Boolean = get(FUSED_AGGREGATE_ENABLED)
+  lazy val fusedOperatorsMinBatchRows: Int = get(FUSED_OPERATORS_MIN_BATCH_ROWS)
 
   lazy val useArrowCopyOptimization: Boolean = get(USE_ARROW_OPT)
 
