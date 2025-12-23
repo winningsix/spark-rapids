@@ -1999,15 +1999,6 @@ case class GpuHashAggregateExec(
   }
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    // #region agent log - entry point
-    try {
-      val debugLogPath = "/home/ferdinandx/code/parallel/.cursor/debug.log"
-      val fw = new java.io.FileWriter(debugLogPath, true)
-      fw.write(s"""{"hypothesisId":"ENTRY","location":"GpuAggregateExec.scala:internalDoExecuteColumnar","message":"Method called","data":{"childType":"${child.getClass.getSimpleName}","aggCount":"${aggregateExpressions.size}"},"timestamp":${System.currentTimeMillis()},"sessionId":"debug-session"}\n""")
-      fw.close()
-    } catch { case _: Exception => }
-    // #endregion
-    
     val aggMetrics = GpuHashAggregateMetrics(
       numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS),
       numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES),
@@ -2038,27 +2029,18 @@ case class GpuHashAggregateExec(
       GpuFusedProjectAggregate.checkSeparateProjectFusion(
         rapidsConf, child, aggregateExprs, modeInfo)
 
-    // #region agent log - hypothesis FUSION
-    def debugLog(hyp: String, msg: String, data: String): Unit = {
-      try {
-        val fw = new java.io.FileWriter("/home/ferdinandx/code/parallel/.cursor/debug.log", true)
-        fw.write(s"""{"hypothesisId":"$hyp","location":"GpuAggregateExec.scala:internalDoExecuteColumnar","message":"$msg","data":$data,"timestamp":${System.currentTimeMillis()},"sessionId":"debug-session"}\n""")
-        fw.close()
-      } catch { case _: Exception => }
-    }
-    debugLog("FUSION", "Fusion decision", s"""{"useFusion":$useFusion,"projectExprsSize":${projectExprs.size},"aggregateExprsSize":${aggregateExprs.size},"childType":"${child.getClass.getSimpleName}"}""")
-    // #endregion
-
     if (useFusion) {
-      // Fused path: execute Project + Aggregate together
-      logWarning(s"[FUSION] Using fused Project+Aggregate path with " +
+      // Fused path: execute Project + Aggregate together (or inputProjection + Aggregate)
+      logWarning(s"[FUSION] Using fused path with " +
         s"${projectExprs.size} project expressions and ${aggregateExprs.size} aggregates")
       
-      debugLog("FUSION", "Taking fused path", s"""{"projectExprsSize":${projectExprs.size},"aggregateExprsSize":${aggregateExprs.size}}""")
+      // Determine the actual child for fused execution
+      val fusionChild = child match {
+        case proj: GpuProjectExec => proj.child
+        case other => other
+      }
       
-      // Get the RDD from Project's child (skip the Project)
-      val projectChild = child.asInstanceOf[GpuProjectExec].child
-      val rdd = projectChild.executeColumnar()
+      val rdd = fusionChild.executeColumnar()
       
       // Localize ALL variables to avoid closure serialization issues (NPE in ClosureCleaner)
       val localProjectExprs = projectExprs

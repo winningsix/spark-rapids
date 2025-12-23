@@ -19,7 +19,7 @@ package com.nvidia.spark.rapids
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
-import ai.rapids.cudf.{Cuda, NvtxColor, NvtxRange}
+import ai.rapids.cudf.{NvtxColor, NvtxRange}
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.{splitSpillableInHalfByRows, withRetry}
 import com.nvidia.spark.rapids.jni.{FusedTransformAggregate, GpuRetryOOM, GpuSplitAndRetryOOM}
@@ -249,10 +249,23 @@ object ConditionalMatcher extends ExpressionMatcher {
   
   override def tryMatch(expr: Expression, ctx: FusionContext): Boolean = {
     expr match {
+      // GpuIf pattern
       case GpuIf(
           GpuGreaterThan(condRef: AttributeReference, GpuLiteral(threshold, _)),
           valRef: AttributeReference,
           GpuLiteral(elseVal, _)) =>
+        (ctx.getColIndex(valRef), ctx.getColIndex(condRef),
+         ctx.toLong(threshold), ctx.toLong(elseVal)) match {
+          case (Some(valIdx), Some(condIdx), Some(thresh), Some(elseV)) =>
+            ctx.builder.addConditional(valIdx, condIdx, thresh, elseV, ctx.aggOp)
+            true
+          case _ => false
+        }
+      // GpuCaseWhen single-branch pattern (equivalent to IF)
+      case GpuCaseWhen(
+          Seq((GpuGreaterThan(condRef: AttributeReference, GpuLiteral(threshold, _)), 
+               valRef: AttributeReference)),
+          Some(GpuLiteral(elseVal, _)), _) =>
         (ctx.getColIndex(valRef), ctx.getColIndex(condRef),
          ctx.toLong(threshold), ctx.toLong(elseVal)) match {
           case (Some(valIdx), Some(condIdx), Some(thresh), Some(elseV)) =>
@@ -274,10 +287,23 @@ object ConditionalCoalesceMatcher extends ExpressionMatcher {
   
   override def tryMatch(expr: Expression, ctx: FusionContext): Boolean = {
     expr match {
+      // GpuIf pattern
       case GpuIf(
           GpuGreaterThan(condRef: AttributeReference, GpuLiteral(threshold, _)),
           GpuCoalesce(Seq(valRef: AttributeReference, GpuLiteral(defaultVal, _))),
           GpuLiteral(elseVal, _)) =>
+        (ctx.getColIndex(valRef), ctx.getColIndex(condRef),
+         ctx.toLong(threshold), ctx.toLong(defaultVal), ctx.toLong(elseVal)) match {
+          case (Some(valIdx), Some(condIdx), Some(thresh), Some(defVal), Some(elseV)) =>
+            ctx.builder.addConditionalCoalesce(valIdx, condIdx, thresh, defVal, elseV, ctx.aggOp)
+            true
+          case _ => false
+        }
+      // GpuCaseWhen single-branch with coalesce (equivalent to IF with coalesce)
+      case GpuCaseWhen(
+          Seq((GpuGreaterThan(condRef: AttributeReference, GpuLiteral(threshold, _)),
+               GpuCoalesce(Seq(valRef: AttributeReference, GpuLiteral(defaultVal, _))))),
+          Some(GpuLiteral(elseVal, _)), _) =>
         (ctx.getColIndex(valRef), ctx.getColIndex(condRef),
          ctx.toLong(threshold), ctx.toLong(defaultVal), ctx.toLong(elseVal)) match {
           case (Some(valIdx), Some(condIdx), Some(thresh), Some(defVal), Some(elseV)) =>
@@ -415,9 +441,9 @@ object GpuFusedProjectAggregate extends Logging {
   }
 
   // Aggregation operation constants (must match JNI)
+  // Note: AGG_AVG is not used because partial AVG is expanded to (SUM, COUNT)
   private val AGG_SUM = FusedTransformAggregate.AGG_SUM
   private val AGG_COUNT = FusedTransformAggregate.AGG_COUNT
-  private val AGG_AVG = FusedTransformAggregate.AGG_AVG
   private val AGG_MIN = FusedTransformAggregate.AGG_MIN
   private val AGG_MAX = FusedTransformAggregate.AGG_MAX
 
@@ -433,24 +459,21 @@ object GpuFusedProjectAggregate extends Logging {
       aggExprs: Seq[GpuAggregateExpression],
       modeInfo: AggregateModeInfo): Boolean = {
     
-    System.err.println(s"[FUSION-TRACE] shouldTryFusion: aggExprs.size=${aggExprs.size}")
     
     // Check configuration
     if (!conf.enableFusedTransformAggregate) {
-      System.err.println("[FUSION-TRACE] disabled by configuration")
       return false
     }
     
     // Check minimum columns threshold
     val minCols = conf.fusedTransformAggregateMinColumns
     if (aggExprs.size < minCols) {
-      System.err.println(s"[FUSION-TRACE] too few aggs: ${aggExprs.size} < $minCols")
       return false
     }
     
-    // Only for Partial or Complete modes (where inputProjection is used)
-    if (!modeInfo.hasPartialMode && !modeInfo.hasCompleteMode) {
-      logDebug(s"[FUSION] not Partial/Complete: hasPartial=${modeInfo.hasPartialMode}")
+    // Only for Partial mode - Complete mode receives already-aggregated data
+    if (!modeInfo.hasPartialMode) {
+      logDebug(s"[FUSION] not Partial mode: hasPartial=${modeInfo.hasPartialMode}")
       return false
     }
     
@@ -490,53 +513,28 @@ object GpuFusedProjectAggregate extends Logging {
    * @return (shouldFuse, projectExprs, projectInputAttrs) 
    *         Returns project info if child is GpuProjectExec with fusable expressions
    */
-  // #region agent log - debug file path
-  private val DEBUG_LOG_PATH = "/home/ferdinandx/code/parallel/.cursor/debug.log"
-  private def debugLog(hypId: String, msg: String, data: Map[String, Any]): Unit = {
-    try {
-      val json = s"""{"hypothesisId":"$hypId","location":"GpuFusedProjectAggregate.scala","message":"$msg","data":${data.map{case(k,v)=>s""""$k":"$v""""}.mkString("{",",","}")},"timestamp":${System.currentTimeMillis()},"sessionId":"debug-session"}"""
-      val fw = new java.io.FileWriter(DEBUG_LOG_PATH, true)
-      fw.write(json + "\n")
-      fw.close()
-    } catch { case _: Exception => }
-  }
-  // #endregion
-
   def checkSeparateProjectFusion(
       conf: RapidsConf,
       childPlan: org.apache.spark.sql.execution.SparkPlan,
       aggExprs: Seq[GpuAggregateExpression],
       modeInfo: AggregateModeInfo): (Boolean, Seq[NamedExpression], Seq[Attribute]) = {
     
-    // #region agent log - entry
-    debugLog("A", "checkSeparateProjectFusion called", Map(
-      "childType" -> childPlan.getClass.getSimpleName,
-      "aggExprsSize" -> aggExprs.size.toString,
-      "enabledConfig" -> conf.enableFusedTransformAggregate.toString,
-      "minColumns" -> conf.fusedTransformAggregateMinColumns.toString,
-      "hasPartialMode" -> modeInfo.hasPartialMode.toString,
-      "hasCompleteMode" -> modeInfo.hasCompleteMode.toString
-    ))
-    // #endregion
+    logWarning(s"[FUSION-CHECK] checkSeparateProjectFusion called, child=${childPlan.getClass.getSimpleName}, " +
+      s"aggExprs=${aggExprs.size}, modeInfo.hasPartialMode=${modeInfo.hasPartialMode}")
     
     if (!conf.enableFusedTransformAggregate) {
-      // #region agent log - hypothesis B
-      debugLog("B", "REJECTED: fusion disabled by config", Map("reason" -> "enableFusedTransformAggregate=false"))
-      // #endregion
+      logWarning("[FUSION-CHECK] Fusion disabled by config")
       return (false, Seq.empty, Seq.empty)
     }
     
     if (aggExprs.size < conf.fusedTransformAggregateMinColumns) {
-      // #region agent log - hypothesis D
-      debugLog("D", "REJECTED: too few aggregates", Map("aggSize" -> aggExprs.size.toString, "minRequired" -> conf.fusedTransformAggregateMinColumns.toString))
-      // #endregion
+      logWarning(s"[FUSION-CHECK] Not enough agg expressions: ${aggExprs.size} < ${conf.fusedTransformAggregateMinColumns}")
       return (false, Seq.empty, Seq.empty)
     }
     
-    if (!modeInfo.hasPartialMode && !modeInfo.hasCompleteMode) {
-      // #region agent log - hypothesis C
-      debugLog("C", "REJECTED: not Partial/Complete mode", Map("hasPartial" -> modeInfo.hasPartialMode.toString, "hasComplete" -> modeInfo.hasCompleteMode.toString))
-      // #endregion
+    // Only for Partial mode - Complete mode receives already-aggregated data
+    if (!modeInfo.hasPartialMode) {
+      logWarning("[FUSION-CHECK] Not partial mode")
       return (false, Seq.empty, Seq.empty)
     }
     
@@ -577,17 +575,63 @@ object GpuFusedProjectAggregate extends Logging {
         val threshold = math.max(1, proj.projectList.size / 4) // 25% threshold for project
         
         if (fusableCount >= threshold) {
-          logWarning(s"[FUSION-CHECK] ACCEPTED: $fusableCount/${proj.projectList.size} fusable (threshold=$threshold)")
-          (true, proj.projectList, proj.child.output)
+          // CRITICAL: Must also check that ALL aggregate inputs can be fused
+          // Build map of project expression IDs to their fusability
+          val projectFusabilityMap = proj.projectList.map { pe =>
+            val (childExpr, exprId) = pe match {
+              case Alias(child, _) => (child, pe.exprId)
+              case GpuAlias(child, _) => (child, pe.exprId)
+              case ref: AttributeReference => (ref, ref.exprId)
+              case other => (other, pe.exprId)
+            }
+            exprId -> isFusableExpression(childExpr)
+          }.toMap
+          
+          // Check that all aggregate inputs reference fusable project expressions
+          val unfusableAggInputs = aggExprs.flatMap { aggExpr =>
+            aggExpr.aggregateFunction.children.headOption.flatMap {
+              case ref: AttributeReference =>
+                projectFusabilityMap.get(ref.exprId) match {
+                  case Some(false) => Some(ref.name)
+                  case None => None // Not in project, might be direct column reference
+                  case Some(true) => None
+                }
+              case _ => None
+            }
+          }.distinct
+          
+          if (unfusableAggInputs.nonEmpty) {
+            // Log detailed expression types for debugging
+            val unfusableDetails = proj.projectList.filter { pe =>
+              val exprName = pe match {
+                case Alias(_, n) => n
+                case GpuAlias(_, n) => n
+                case _ => ""
+              }
+              unfusableAggInputs.contains(exprName)
+            }.take(3).map { pe =>
+              val (childExpr, exprName) = pe match {
+                case Alias(child, name) => (child, name)
+                case GpuAlias(child, name) => (child, name)
+                case _ => (pe, "?")
+              }
+              s"$exprName:${childExpr.getClass.getSimpleName}"
+            }
+            logWarning(s"[FUSION-CHECK] REJECTED: aggregate inputs reference unfusable project expressions: " +
+              s"${unfusableAggInputs.take(5).mkString(", ")}, types: ${unfusableDetails.mkString(", ")}")
+            (false, Seq.empty, Seq.empty)
+          } else {
+            logWarning(s"[FUSION-CHECK] ACCEPTED: $fusableCount/${proj.projectList.size} project fusable, " +
+              s"all ${aggExprs.size} aggregate inputs fusable")
+            (true, proj.projectList, proj.child.output)
+          }
         } else {
           logWarning(s"[FUSION-CHECK] REJECTED: insufficient fusable $fusableCount/${proj.projectList.size}")
           (false, Seq.empty, Seq.empty)
         }
         
-      case _ =>
-        // #region agent log - hypothesis A
-        debugLog("A", "REJECTED: child is NOT GpuProjectExec", Map("actualChildType" -> childPlan.getClass.getSimpleName))
-        // #endregion
+      case other =>
+        logWarning(s"[FUSION-CHECK] Child is not GpuProjectExec: ${other.getClass.getSimpleName}")
         (false, Seq.empty, Seq.empty)
     }
   }
@@ -668,6 +712,24 @@ object GpuFusedProjectAggregate extends Logging {
       case GpuMultiply(
           GpuCoalesce(Seq(GpuIf(_, _, _), _: GpuLiteral)),
           GpuCoalesce(Seq(GpuIf(_, _, _), _: GpuLiteral)), _) => true
+      
+      // GpuCaseWhen with single branch - equivalent to IF(cond, then, else)
+      // Pattern: CASE WHEN cond > threshold THEN col ELSE literal END
+      case GpuCaseWhen(
+          Seq((GpuGreaterThan(_: AttributeReference, _: GpuLiteral), _: AttributeReference)),
+          Some(_: GpuLiteral), _) => true
+      
+      // GpuCaseWhen with coalesce in then branch
+      // Pattern: CASE WHEN cond > threshold THEN COALESCE(col, d) ELSE literal END
+      case GpuCaseWhen(
+          Seq((GpuGreaterThan(_: AttributeReference, _: GpuLiteral), 
+               GpuCoalesce(Seq(_: AttributeReference, _: GpuLiteral)))),
+          Some(_: GpuLiteral), _) => true
+      
+      // Nested coalesce * coalesce on CaseWhen result
+      case GpuMultiply(
+          GpuCoalesce(Seq(GpuCaseWhen(_, _, _), _: GpuLiteral)),
+          GpuCoalesce(Seq(GpuCaseWhen(_, _, _), _: GpuLiteral)), _) => true
           
       case _ => false
     }
@@ -767,17 +829,6 @@ object GpuFusedProjectAggregate extends Logging {
       metrics: GpuHashAggregateMetrics,
       enableWarpReduction: Boolean): Option[SpillableColumnarBatch] = {
     
-    // #region agent log
-    def debugLog(hyp: String, msg: String, data: String): Unit = {
-      try {
-        val fw = new java.io.FileWriter("/home/ferdinandx/code/parallel/.cursor/debug.log", true)
-        fw.write(s"""{"hypothesisId":"$hyp","location":"executeFused","message":"$msg","data":$data,"timestamp":${System.currentTimeMillis()},"sessionId":"debug-session"}\n""")
-        fw.close()
-      } catch { case _: Exception => }
-    }
-    debugLog("EXEC", "executeFused entry", s"""{"inputRows":${inputBatch.numRows()},"aggExprs":${aggExprs.size},"groupingExprs":${groupingExprs.size}}""")
-    // #endregion
-    
     val computeAggTime = metrics.computeAggTime
     val opTime = metrics.opTime
     val numAggOps = metrics.numAggOps
@@ -789,55 +840,44 @@ object GpuFusedProjectAggregate extends Logging {
           attr.exprId -> idx
         }.toMap
         
-        // Build expression builder
-        val builder = new ExpressionBuilder()
-        var allFusable = true
-        var failedExprIdx = -1
-        var failedExprInfo = ""
+        // THREE CASES LOGIC:
+        // Case 1: Project部分支持, Agg全部支持 → fuse (Project保留不支持的)
+        // Case 2: Project部分支持, Agg部分支持 → 不fuse
+        // Case 3: Project全部支持, Agg部分支持 → 不fuse
+        // 
+        // Key: Only fuse when ALL aggregate expressions can be fused
         
+        val builder = new ExpressionBuilder()
+        var allAggsFusable = true
+        var failedAggIdx = -1
+        
+        // First pass: check if ALL aggregates can be fused
         aggExprs.zipWithIndex.foreach { case (aggExpr, idx) =>
-          if (allFusable && !addExpression(builder, aggExpr, projectExprs, colIndexMap)) {
-            allFusable = false
-            failedExprIdx = idx
-            // #region agent log - capture failing expression details
-            val aggFuncName = aggExpr.aggregateFunction.getClass.getSimpleName
-            val aggChildren = aggExpr.aggregateFunction.children.map(_.getClass.getSimpleName).mkString(",")
-            val aggInputStr = aggExpr.aggregateFunction.children.headOption.map { c =>
-              c match {
-                case ref: AttributeReference => s"ref:${ref.name}(${ref.exprId})"
-                case other => s"${other.getClass.getSimpleName}:${other.toString.take(100)}"
-              }
-            }.getOrElse("none")
-            failedExprInfo = s"""{"idx":$idx,"aggFunc":"$aggFuncName","children":"$aggChildren","input":"$aggInputStr"}"""
-            debugLog("D", "FAILED at expression", failedExprInfo)
-            // #endregion
+          if (allAggsFusable && !addExpression(builder, aggExpr, projectExprs, colIndexMap)) {
+            allAggsFusable = false
+            failedAggIdx = idx
           }
         }
         
-        // #region agent log - hypothesis D
-        debugLog("D", "Expression building complete", s"""{"allFusable":$allFusable,"failedIdx":$failedExprIdx,"totalExprs":${aggExprs.size}}""")
-        // #endregion
-        
-        if (!allFusable) {
-          debugLog("D", "REJECTED - not all fusable", s"""{"failedIdx":$failedExprIdx,"failedExpr":$failedExprInfo}""")
-          logDebug("Some expressions cannot be fused, falling back")
+        // If not all aggregates are fusable, fall back to standard path (Case 2 & 3)
+        if (!allAggsFusable) {
+          logWarning(s"[FUSION] Agg not fully supported (failed at idx $failedAggIdx), " +
+            s"falling back to standard path")
           return None
         }
         
+        // All aggregates are fusable - proceed with fusion (Case 1 or full fusion)
         // Get group-by column indices
         val groupByIndices = extractGroupByIndices(groupingExprs, projectExprs, colIndexMap)
         
-        // #region agent log - hypothesis E
-        debugLog("E", "Group-by indices extracted", s"""{"indices":[${groupByIndices.mkString(",")}],"count":${groupByIndices.length}}""")
-        // #endregion
-        
         if (groupByIndices.isEmpty) {
-          debugLog("E", "REJECTED - empty group-by indices", "{}")
           logDebug("No valid group-by columns found, falling back")
           return None
         }
         
-        // Execute fused kernel with retry support
+        logWarning(s"[FUSION] All ${aggExprs.size} aggregates fusable, executing fused kernel")
+        
+        // Execute fused kernel
         val spillable = SpillableColumnarBatch(
           GpuColumnVector.incRefCounts(inputBatch),
           SpillPriorities.ACTIVE_BATCHING_PRIORITY)
@@ -847,14 +887,6 @@ object GpuFusedProjectAggregate extends Logging {
             executeFusedKernel(cb, builder, groupByIndices, enableWarpReduction)
           }
         }.toSeq
-        
-        // #region agent log - hypothesis C
-        val resultInfo = result.headOption match {
-          case Some(s) => s"""{"resultRows":${s.numRows()}}"""
-          case None => """{"resultRows":0}"""
-        }
-        debugLog("C", "executeFusedKernel result", resultInfo)
-        // #endregion
         
         // Update metrics
         numAggOps += 1
@@ -867,7 +899,6 @@ object GpuFusedProjectAggregate extends Logging {
       case e: GpuSplitAndRetryOOM =>
         throw e  // Let retry framework handle  
       case NonFatal(e) =>
-        debugLog("ERR", s"Exception in executeFused", s"""{"error":"${e.getMessage.replace("\"", "'")}"}""")
         logWarning(s"Fused execution failed: ${e.getMessage}, falling back to standard path")
         None
     }
@@ -879,26 +910,37 @@ object GpuFusedProjectAggregate extends Logging {
       projectExprs: Seq[NamedExpression],
       colIndexMap: Map[ExprId, Int]): Boolean = {
     
-    // #region agent log
-    def debugLog(msg: String, data: String): Unit = {
-      try {
-        val fw = new java.io.FileWriter("/home/ferdinandx/code/parallel/.cursor/debug.log", true)
-        fw.write(s"""{"hypothesisId":"ADD","location":"addExpression","message":"$msg","data":$data,"timestamp":${System.currentTimeMillis()},"sessionId":"debug-session"}\n""")
-        fw.close()
-      } catch { case _: Exception => }
+    // For PARTIAL mode AVG, we need to output (SUM, COUNT) = 2 columns
+    // This is because Spark's partial AVG produces 2 intermediate columns
+    // that will be merged in the final aggregation phase.
+    aggExpr.aggregateFunction match {
+      case _: GpuAverage =>
+        // Add two expressions: SUM and COUNT for the same input
+        val aggInputOpt = aggExpr.aggregateFunction.children.headOption
+        if (aggInputOpt.isEmpty) return false
+        val aggInput = aggInputOpt.get
+        
+        aggInput match {
+          case ref: AttributeReference =>
+            // First add SUM expression
+            val sumOk = analyzeAndAddExpression(builder, ref, projectExprs, colIndexMap, AGG_SUM)
+            if (!sumOk) return false
+            // Then add COUNT expression  
+            val countOk = analyzeAndAddExpression(builder, ref, projectExprs, colIndexMap, AGG_COUNT)
+            return countOk
+          case _ =>
+            return false
+        }
+      case _ => // Fall through to normal handling
     }
-    // #endregion
     
     // Get the aggregation operation type
-    val aggFuncType = aggExpr.aggregateFunction.getClass.getSimpleName
     val aggOp = aggExpr.aggregateFunction match {
       case _: GpuBasicSum => AGG_SUM
       case _: GpuCount => AGG_COUNT
-      case _: GpuAverage => AGG_AVG
       case _: GpuMin => AGG_MIN
       case _: GpuMax => AGG_MAX
       case _ => 
-        debugLog("REJECTED unsupported agg function", s"""{"aggFuncType":"$aggFuncType"}""")
         return false
     }
     
@@ -907,44 +949,31 @@ object GpuFusedProjectAggregate extends Logging {
     if (aggInputOpt.isEmpty) {
       // COUNT(*) has no children - try addCountAll directly
       if (aggExpr.aggregateFunction.isInstanceOf[GpuCount]) {
-        debugLog("COUNT(*) no children, using addCountAll", s"""{"aggFuncType":"$aggFuncType"}""")
         builder.addCountAll(AGG_COUNT)
         return true
       }
-      debugLog("REJECTED no children", s"""{"aggFuncType":"$aggFuncType"}""")
       return false
     }
     val aggInput = aggInputOpt.get
-    val inputType = aggInput.getClass.getSimpleName
     
     aggInput match {
       case ref: AttributeReference =>
-        debugLog("Processing AttributeReference", s"""{"refName":"${ref.name}","exprId":"${ref.exprId}","aggOp":$aggOp}""")
-        val result = analyzeAndAddExpression(builder, ref, projectExprs, colIndexMap, aggOp)
-        if (!result) {
-          debugLog("REJECTED analyzeAndAddExpression failed", s"""{"aggFuncType":"$aggFuncType","inputType":"$inputType","refName":"${ref.name}","exprId":"${ref.exprId}"}""")
-        }
-        result
-      case lit: GpuLiteral =>
+        analyzeAndAddExpression(builder, ref, projectExprs, colIndexMap, aggOp)
+      case _: GpuLiteral =>
         // For COUNT(literal), treat as COUNT(*)
         if (aggExpr.aggregateFunction.isInstanceOf[GpuCount]) {
-          debugLog("COUNT(GpuLiteral), using addCountAll", s"""{"literal":"${lit.value}"}""")
           builder.addCountAll(AGG_COUNT)
           return true
         }
-        debugLog("REJECTED GpuLiteral for non-COUNT", s"""{"aggFuncType":"$aggFuncType","literal":"${lit.value}"}""")
         false
-      case lit: Literal =>
+      case _: Literal =>
         // For COUNT(literal) with Catalyst Literal, treat as COUNT(*)
         if (aggExpr.aggregateFunction.isInstanceOf[GpuCount]) {
-          debugLog("COUNT(Literal), using addCountAll", s"""{"literal":"${lit.value}"}""")
           builder.addCountAll(AGG_COUNT)
           return true
         }
-        debugLog("REJECTED Literal for non-COUNT", s"""{"aggFuncType":"$aggFuncType","literal":"${lit.value}"}""")
         false
       case _ =>
-        debugLog("REJECTED unknown input type", s"""{"aggFuncType":"$aggFuncType","inputType":"$inputType","actualClass":"${aggInput.getClass.getName}","fullExpr":"${aggInput.toString.take(200)}"}""")
         false
     }
   }
@@ -956,17 +985,6 @@ object GpuFusedProjectAggregate extends Logging {
       colIndexMap: Map[ExprId, Int],
       aggOp: Int): Boolean = {
     
-    // #region agent log
-    def debugLog(msg: String, data: String): Unit = {
-      try {
-        val fw = new java.io.FileWriter("/home/ferdinandx/code/parallel/.cursor/debug.log", true)
-        fw.write(s"""{"hypothesisId":"ANALYZE","location":"analyzeAndAddExpression","message":"$msg","data":$data,"timestamp":${System.currentTimeMillis()},"sessionId":"debug-session"}\n""")
-        fw.close()
-      } catch { case _: Exception => }
-    }
-    // #endregion
-    
-    debugLog("Entry", s"""{"refName":"${ref.name}","refExprId":"${ref.exprId}","projectCount":${projectExprs.size}}""")
     
     // Find matching project expression - handle both Alias and GpuAlias
     val projectExpr = projectExprs.find { pe =>
@@ -979,31 +997,21 @@ object GpuFusedProjectAggregate extends Logging {
     }
     
     projectExpr match {
-      case Some(Alias(child, name)) =>
-        debugLog("Found Alias", s"""{"name":"$name","childType":"${child.getClass.getSimpleName}","childStr":"${child.toString.take(200).replace("\"", "'")}"}""")
-        val result = analyzeProjectChild(builder, child, colIndexMap, aggOp)
-        if (!result) debugLog("Alias child failed", s"""{"childType":"${child.getClass.getSimpleName}","refName":"${ref.name}","childStr":"${child.toString.take(200).replace("\"", "'")}"}""")
-        result
-      case Some(GpuAlias(child, name)) =>
-        debugLog("Found GpuAlias", s"""{"name":"$name","childType":"${child.getClass.getSimpleName}","childStr":"${child.toString.take(200).replace("\"", "'")}"}""")
-        val result = analyzeProjectChild(builder, child, colIndexMap, aggOp)
-        if (!result) debugLog("GpuAlias child failed", s"""{"childType":"${child.getClass.getSimpleName}","refName":"${ref.name}","childStr":"${child.toString.take(200).replace("\"", "'")}"}""")
-        result
+      case Some(Alias(child, _)) =>
+        analyzeProjectChild(builder, child, colIndexMap, aggOp)
+      case Some(GpuAlias(child, _)) =>
+        analyzeProjectChild(builder, child, colIndexMap, aggOp)
       case Some(a: AttributeReference) =>
-        debugLog("Found AttributeReference", s"""{"attrName":"${a.name}","attrExprId":"${a.exprId}"}""")
         colIndexMap.get(a.exprId) match {
           case Some(idx) =>
             builder.addIdentity(idx, aggOp)
             true
           case None => 
-            debugLog("AttributeRef not in colIndexMap", s"""{"refName":"${ref.name}","attrExprId":"${a.exprId}"}""")
             false
         }
       case None =>
-        debugLog("No matching project expr", s"""{"refName":"${ref.name}","refExprId":"${ref.exprId}","projectTypes":"${projectExprs.take(5).map(_.getClass.getSimpleName).mkString(",")}"}""")
         false
-      case Some(other) =>
-        debugLog("Unknown project expr type", s"""{"refName":"${ref.name}","type":"${other.getClass.getSimpleName}"}""")
+      case Some(_) =>
         false
     }
   }
@@ -1032,15 +1040,6 @@ object GpuFusedProjectAggregate extends Logging {
     val matched = ExpressionMatcherRegistry.tryMatch(expr, ctx)
     
     if (!matched) {
-      // #region agent log
-      try {
-        val fw = new java.io.FileWriter("/tmp/fused_debug.log", true)
-        val exprType = expr.getClass.getSimpleName
-        val exprSql = expr.sql.replace("\"", "'").take(100)
-        fw.write(s"""{"hypothesisId":"H","location":"analyzeProjectChild","message":"Expression not matched","data":{"exprType":"$exprType","exprSql":"$exprSql"},"timestamp":${System.currentTimeMillis()}}\n""")
-        fw.close()
-      } catch { case _: Exception => }
-      // #endregion
       
       // Detailed debug logging for unmatched expressions
       val exprDetails = expr match {
@@ -1077,11 +1076,28 @@ object GpuFusedProjectAggregate extends Logging {
       aggExpr: GpuAggregateExpression,
       colIndexMap: Map[ExprId, Int]): Boolean = {
     
+    // For PARTIAL mode AVG, we need to output (SUM, COUNT) = 2 columns
+    aggExpr.aggregateFunction match {
+      case _: GpuAverage =>
+        val aggInput = aggExpr.aggregateFunction.children.headOption
+        aggInput match {
+          case Some(expr) =>
+            // First add SUM expression
+            val sumOk = analyzeProjectChild(builder, expr, colIndexMap, AGG_SUM)
+            if (!sumOk) return false
+            // Then add COUNT expression
+            val countOk = analyzeProjectChild(builder, expr, colIndexMap, AGG_COUNT)
+            return countOk
+          case None =>
+            return false
+        }
+      case _ => // Fall through to normal handling
+    }
+    
     // Get the aggregation operation type
     val aggOp = aggExpr.aggregateFunction match {
       case _: GpuBasicSum => AGG_SUM
       case _: GpuCount => AGG_COUNT
-      case _: GpuAverage => AGG_AVG
       case _: GpuMin => AGG_MIN
       case _: GpuMax => AGG_MAX
       case _ => 
@@ -1152,27 +1168,8 @@ object GpuFusedProjectAggregate extends Logging {
       builder: ExpressionBuilder,
       groupByIndices: Array[Int],
       enableWarpReduction: Boolean): SpillableColumnarBatch = {
-    
-    // #region agent log
-    def debugLog(hyp: String, msg: String, data: String): Unit = {
-      try {
-        val fw = new java.io.FileWriter("/tmp/fused_debug.log", true)
-        fw.write(s"""{"hypothesisId":"$hyp","location":"executeFusedKernel","message":"$msg","data":$data,"timestamp":${System.currentTimeMillis()}}\n""")
-        fw.close()
-      } catch { case _: Exception => }
-    }
-    debugLog("H20", "executeFusedKernel entry - using ContiguousTable API", 
-      s"""{"inputRows":${inputBatch.numRows()},"inputCols":${inputBatch.numCols()},"groupByIndices":[${groupByIndices.mkString(",")}]}""")
-    // #endregion
-    
     withResource(new NvtxRange("FusedTransformAggregate", NvtxColor.CYAN)) { _ =>
     withResource(GpuColumnVector.from(inputBatch)) { inputTable =>
-      
-      // #region agent log
-      debugLog("H20", "Calling JNI FusedTransformAggregate.execute (ContiguousTable)", 
-        s"""{"tableRows":${inputTable.getRowCount},"tableCols":${inputTable.getNumberOfColumns}}""")
-      // #endregion
-      
       // Execute fused kernel - returns FusedResult with regular Tables
       withResource(FusedTransformAggregate.execute(
           inputTable, groupByIndices, builder, enableWarpReduction)) { fusedResult =>
@@ -1180,15 +1177,8 @@ object GpuFusedProjectAggregate extends Logging {
         val keysTable = fusedResult.getKeys
         val valuesTable = fusedResult.getValues
         
-        // #region agent log
-        val keysInfo = if (keysTable != null) s""""rows":${keysTable.getRowCount},"cols":${keysTable.getNumberOfColumns}""" else """"null":true"""
-        val valsInfo = if (valuesTable != null) s""""rows":${valuesTable.getRowCount},"cols":${valuesTable.getNumberOfColumns}""" else """"null":true"""
-        debugLog("H21", "JNI result (Tables)", s"""{"keys":{$keysInfo},"values":{$valsInfo}}""")
-        // #endregion
-        
         if (keysTable == null || valuesTable == null || 
             (keysTable.getRowCount == 0 && valuesTable.getRowCount == 0)) {
-          debugLog("H21", "EMPTY RESULT - returning empty batch", "{}")
           SpillableColumnarBatch(
             new ColumnarBatch(Array.empty, 0),
             SpillPriorities.ACTIVE_BATCHING_PRIORITY)
@@ -1231,21 +1221,8 @@ object GpuFusedProjectAggregate extends Logging {
           // Create ColumnarBatch - columns now have completely independent memory
           val batch = new ColumnarBatch(gpuVectors.toArray, numRows)
           
-          // #region agent log
-          debugLog("H21", "Batch created with DEEP COPY columns", 
-            s"""{"numRows":$numRows,"numCols":${gpuVectors.length}}""")
-          // #endregion
-          
           // SpillableColumnarBatch will pack on-demand when spilling
-          val spillable = SpillableColumnarBatch(
-            batch, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
-          
-          // #region agent log
-          debugLog("H21", "SpillableColumnarBatch created", 
-            s"""{"numRows":$numRows,"spillId":"${System.identityHashCode(spillable)}"}""")
-          // #endregion
-          
-          spillable
+          SpillableColumnarBatch(batch, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
         }
       }
     }
@@ -1293,16 +1270,6 @@ class GpuFusedProjectAggregateIterator(
   }
 
   override def next(): ColumnarBatch = {
-    // #region agent log - H2: Track batch consumption timing
-    def debugLog(hyp: String, msg: String, data: String): Unit = {
-      try {
-        val fw = new java.io.FileWriter("/home/ferdinandx/code/parallel/.cursor/debug.log", true)
-        fw.write(s"""{"hypothesisId":"$hyp","location":"GpuFusedProjectAggregateIterator.next","message":"$msg","data":$data,"timestamp":${System.currentTimeMillis()},"sessionId":"debug-session"}\n""")
-        fw.close()
-      } catch { case _: Exception => }
-    }
-    // #endregion
-    
     if (!initialized) {
       initializeResults()
       initialized = true
@@ -1312,15 +1279,9 @@ class GpuFusedProjectAggregateIterator(
     closePreviousBatchResources()
     
     val batch = resultIter.next()
-    val batchId = System.identityHashCode(batch)
     currentResultIdx += 1
     metrics.numOutputRows += batch.numRows()
     metrics.numOutputBatches += 1
-    
-    // #region agent log - H2
-    debugLog("H2", s"next() returning batch idx=$currentResultIdx", 
-      s"""{"batchId":"$batchId","numRows":${batch.numRows()},"hasMore":${resultIter.hasNext}}""")
-    // #endregion
     
     // FIX: Ensure all GPU operations are complete before returning batch to shuffle
     // This prevents any async GPU operations from corrupting data during D2H copy
@@ -1330,7 +1291,6 @@ class GpuFusedProjectAggregateIterator(
     if (!resultIter.hasNext) {
       // Mark that we should close everything on next access or finalization
       allConsumed = true
-      debugLog("H2", "All batches consumed", s"""{"totalIdx":$currentResultIdx}""")
     }
     batch
   }
@@ -1339,102 +1299,77 @@ class GpuFusedProjectAggregateIterator(
   private var lastClosedIdx = -1
   
   private def closePreviousBatchResources(): Unit = {
-    // #region agent log - H7: Disable input batch closing to test if this causes the crash
-    def debugLog(hyp: String, msg: String, data: String): Unit = {
-      try {
-        val fw = new java.io.FileWriter("/home/ferdinandx/code/parallel/.cursor/debug.log", true)
-        fw.write(s"""{"hypothesisId":"$hyp","location":"closePreviousBatchResources","message":"$msg","data":$data,"timestamp":${System.currentTimeMillis()},"sessionId":"debug-session"}\n""")
-        fw.close()
-      } catch { case _: Exception => }
-    }
-    // #endregion
-    
     // H7: Temporarily disable closing input batches to test if this is causing the crash
     // The input batches will be closed when the task completes (task cleanup)
     // This may cause higher memory usage but will help isolate the root cause
     val _ = (inputBatchesToClose, allConsumed)  // suppress unused warnings
     lastClosedIdx = lastClosedIdx  // suppress "never updated" warning
-    debugLog("H7", "closePreviousBatchResources called but SKIPPING close", 
-      s"""{"currentResultIdx":$currentResultIdx,"lastClosedIdx":$lastClosedIdx}""")
     
     // DISABLED for debugging - don't close any batches
     // if (currentResultIdx > 0 && lastClosedIdx < currentResultIdx - 1) { ... }
   }
 
   private def initializeResults(): Unit = {
-    // #region agent log
-    def debugLog(hyp: String, msg: String, data: String): Unit = {
-      try {
-        val fw = new java.io.FileWriter("/tmp/fused_debug.log", true)
-        fw.write(s"""{"hypothesisId":"$hyp","location":"GpuFusedProjectAggregateIterator.initializeResults","message":"$msg","data":$data,"timestamp":${System.currentTimeMillis()}}\n""")
-        fw.close()
-      } catch { case _: Exception => }
-    }
-    debugLog("MERGE", "initializeResults called - with merge pass", s"""{}""")
-    // #endregion
+    // FIX: Stream processing - process each batch immediately, don't buffer all inputs
+    // This reduces memory from O(all_input_data) to O(partial_results)
+    import scala.collection.mutable.ArrayBuffer
+    val partialResults = ArrayBuffer[SpillableColumnarBatch]()
     
-    // Collect all input batches
-    val allBatches = inputIter.toArray
-    
-    debugLog("MERGE", "Input batches collected", s"""{"batchCount":${allBatches.length},"batchRows":[${allBatches.map(_.numRows()).mkString(",")}]}""")
-    
-    if (allBatches.isEmpty) {
-      debugLog("MERGE", "EMPTY INPUT - no batches", "{}")
-      resultIter = Iterator.empty
-      return
-    }
-
     try {
-      // PHASE 1: First Pass - Run fused kernel on each batch (partial aggregation)
+      // PHASE 1: Stream input batches - process each immediately, don't buffer
+      // This is critical for large datasets where input >> partial results
       var batchIdx = 0
-      val partialResults = allBatches.flatMap { inputBatch =>
-        val result = GpuFusedProjectAggregate.executeFused(
-          inputBatch,
-          projectExprs,
-          groupingExprs,
-          aggregateExprs,
-          inputAttrs,
-          metrics,
-          enableWarpReduction
-        )
+      var hasInput = false
+      
+      while (inputIter.hasNext) {
+        hasInput = true
+        val inputBatch = inputIter.next()
         
-        val resultInfo = result match {
-          case Some(s) => s"""{"status":"Some","numRows":${s.numRows()}}"""
-          case None => """{"status":"None"}"""
-        }
-        debugLog("MERGE", s"First pass result for batch $batchIdx", resultInfo)
-        batchIdx += 1
-        
-        result match {
-          case Some(spillable) =>
-            fusedBatchesMetric.foreach(_ += 1)
-            GpuFusedProjectAggregate.incrementFusionCounter()
-            inputBatch.close()
-            Some(spillable)
-          case None =>
-            inputBatch.close()
-            None
+        try {
+          val result = GpuFusedProjectAggregate.executeFused(
+            inputBatch,
+            projectExprs,
+            groupingExprs,
+            aggregateExprs,
+            inputAttrs,
+            metrics,
+            enableWarpReduction
+          )
+          
+          batchIdx += 1
+          
+          result match {
+            case Some(spillable) =>
+              fusedBatchesMetric.foreach(_ += 1)
+              GpuFusedProjectAggregate.incrementFusionCounter()
+              partialResults += spillable
+            case None =>
+              // CRITICAL: Fusion failed at runtime - this should not happen if planning was correct
+              // Throw exception to fail the task instead of silently losing data
+              throw new IllegalStateException(
+                s"[FUSION BUG] executeFused returned None for batch $batchIdx. " +
+                "This indicates a mismatch between planning and execution. " +
+                "Planning accepted fusion but execution failed. " +
+                "Please report this bug and disable fusion with: " +
+                "spark.rapids.sql.fusedTransformAggregate.enabled=false")
+          }
+        } finally {
+          // Close input batch immediately after processing - critical for memory
+          inputBatch.close()
         }
       }
       
-      if (partialResults.isEmpty) {
-        debugLog("MERGE", "No partial results", "{}")
+      if (!hasInput || partialResults.isEmpty) {
         resultIter = Iterator.empty
         return
       }
-      
-      debugLog("MERGE", "First pass complete", 
-        s"""{"partialCount":${partialResults.length},"totalRows":${partialResults.map(_.numRows()).sum}}""")
       
       // PHASE 2: Merge Pass - Incrementally merge partial results to avoid OOM
       // Process in chunks to limit memory usage
       if (partialResults.length == 1) {
         // Only one partial result - no merge needed
-        debugLog("MERGE", "Single partial - no merge needed", "{}")
-        spillableBatches = partialResults
+        spillableBatches = partialResults.toArray
       } else {
-        debugLog("MERGE", "Merging multiple partials incrementally", 
-          s"""{"count":${partialResults.length}}""")
         
         // Incremental merge: process in chunks to avoid OOM
         val CHUNK_SIZE = 10  // Merge 10 partials at a time
@@ -1445,36 +1380,18 @@ class GpuFusedProjectAggregateIterator(
           // Handle single-element chunk - need to create DEEP COPY columns to avoid
           // memory sharing issues when this batch is later used in merge rounds
           if (chunk.length == 1) {
-            // #region agent log - H-SINGLE-CHUNK
-            def debugSingle(msg: String, data: String): Unit = {
-              try {
-                val fw = new java.io.FileWriter("/tmp/fused_debug.log", true)
-                fw.write(s"""{"hypothesisId":"H-SINGLE","location":"mergeChunk-single","message":"$msg","data":$data,"timestamp":${System.currentTimeMillis()}}\n""")
-                fw.close()
-              } catch { case _: Exception => }
-            }
-            // #endregion
-            
             val oldSpillable = chunk(0)
-            debugSingle("Processing single-element chunk", s"""{"oldSpillableId":"${System.identityHashCode(oldSpillable)}","numRows":${oldSpillable.numRows()}}""")
             
             // Get the batch from spillable
             val batch = oldSpillable.getColumnarBatch()
             val numRows = batch.numRows()
             val numCols = batch.numCols()
             
-            debugSingle("Got batch from spillable", s"""{"batchId":"${System.identityHashCode(batch)}","numRows":$numRows,"numCols":$numCols}""")
-            
-            // FIX: Use ColumnView.copyToColumnVector() to create DEEP COPIES of each column
-            // This is different from ColumnVector.copyToColumnVector() which only increments refCount
-            // ColumnView.copyToColumnVector() calls native copyColumnViewToCV which actually copies data
-            withResource(GpuColumnVector.from(batch)) { table =>
-              debugSingle("Created table from batch", s"""{"tableRows":${table.getRowCount}}""")
-              
-              val newGpuVectors = new Array[GpuColumnVector](numCols)
+            // FIX: Create table, copy columns, then let withResource close table properly
+            // DO NOT close batch inside withResource - table shares column refs with batch
+            val newGpuVectors = withResource(GpuColumnVector.from(batch)) { table =>
+              val vectors = new Array[GpuColumnVector](numCols)
               for (i <- 0 until numCols) {
-                // table.getColumn(i) returns a ColumnView, NOT a ColumnVector
-                // ColumnView.copyToColumnVector() creates a true deep copy
                 val colView: ai.rapids.cudf.ColumnView = table.getColumn(i)
                 val copiedCol: ai.rapids.cudf.ColumnVector = colView.copyToColumnVector()
                 val dt = copiedCol.getType match {
@@ -1483,62 +1400,36 @@ class GpuFusedProjectAggregateIterator(
                   case ai.rapids.cudf.DType.INT32 => IntegerType
                   case other => throw new UnsupportedOperationException(s"Unsupported type in single chunk: $other")
                 }
-                newGpuVectors(i) = GpuColumnVector.from(copiedCol, dt)
+                vectors(i) = GpuColumnVector.from(copiedCol, dt)
               }
-              
-              debugSingle("Deep copied all columns", s"""{"numCols":$numCols}""")
-              
-              // Close the original resources AFTER creating copies
-              batch.close()
-              oldSpillable.close()
-              
-              debugSingle("Original resources closed", "{}")
-              
-              val newBatch = new ColumnarBatch(newGpuVectors.toArray, numRows)
-              val newSpillable = SpillableColumnarBatch(newBatch, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
-              
-              debugSingle("New spillable created", s"""{"newSpillableId":"${System.identityHashCode(newSpillable)}"}""")
-              
-              return newSpillable
-            }
+              vectors
+            } // table closed here, which decrements ref counts on batch columns
+            
+            // FIX: Only close spillable - it owns the batch and will close it
+            // DO NOT close batch separately - that causes double-free
+            oldSpillable.close()
+            
+            val newBatch = new ColumnarBatch(newGpuVectors.toArray, numRows)
+            return SpillableColumnarBatch(newBatch, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
           }
           
           withResource(new NvtxRange("MergeChunk", NvtxColor.YELLOW)) { _ =>
-            // #region agent log - H-SHUFFLE
-            def debugMerge(msg: String, data: String): Unit = {
-              try {
-                val fw = new java.io.FileWriter("/tmp/fused_debug.log", true)
-                fw.write(s"""{"hypothesisId":"H-MERGE","location":"mergeChunk","message":"$msg","data":$data,"timestamp":${System.currentTimeMillis()}}\n""")
-                fw.close()
-              } catch { case _: Exception => }
-            }
-            // #endregion
-            
-            debugMerge("Starting mergeChunk", s"""{"chunkSize":${chunk.length}}""")
-            
             // Get ColumnarBatches from SpillableColumnarBatch
             val partialBatches = chunk.map(_.getColumnarBatch())
             
             // Create Table views from the batches (this increments ref counts on columns)
             val tables = partialBatches.map(GpuColumnVector.from(_))
             
-            debugMerge("Tables created for concat", s"""{"numTables":${tables.length},"rows":[${tables.map(_.getRowCount).mkString(",")}]}""")
-            
             // Table.concatenate COPIES the data, so it's safe to close sources after
             val concatenated = ai.rapids.cudf.Table.concatenate(tables: _*)
-            
-            debugMerge("Table.concatenate done", s"""{"concatRows":${concatenated.getRowCount}}""")
             
             // FIX: Close the Table objects to decrement ref counts
             tables.foreach(_.close())
             
-            // FIX: Close the ColumnarBatch objects (which closes their GpuColumnVectors)
-            partialBatches.foreach(_.close())
-            
-            // Now close the SpillableColumnarBatch objects
+            // FIX: Only close spillables - they own the batches and will close them
+            // DO NOT close partialBatches separately - that causes double-close and leaks!
             chunk.foreach(_.close())
             
-            debugMerge("Sources closed, starting groupBy", "{}")
             
             withResource(concatenated) { concatTable =>
               val aggSpecs = (numGroupCols until concatTable.getNumberOfColumns).map { colIdx =>
@@ -1550,7 +1441,6 @@ class GpuFusedProjectAggregateIterator(
               withResource(concatTable.groupBy(groupOptions, groupByIndices: _*)
                   .aggregate(aggSpecs: _*)) { mergedTable =>
                   
-                debugMerge("GroupBy aggregate done", s"""{"mergedRows":${mergedTable.getRowCount}}""")
                 
                 // FIX: Use copyToColumnVector() to create TRUE DEEP COPIES of all columns.
                 // This is critical because incRefCount() only increments the reference count
@@ -1560,7 +1450,6 @@ class GpuFusedProjectAggregateIterator(
                 val numRows = mergedTable.getRowCount.toInt
                 val numCols = mergedTable.getNumberOfColumns
                 
-                debugMerge("Creating DEEP COPY columns", s"""{"numRows":$numRows,"numCols":$numCols}""")
                 
                 val gpuVectors = new Array[GpuColumnVector](numCols)
                 for (i <- 0 until numCols) {
@@ -1578,88 +1467,60 @@ class GpuFusedProjectAggregateIterator(
                 }
                 
                 val batch = new ColumnarBatch(gpuVectors.toArray, numRows)
-                val spillable = SpillableColumnarBatch(batch, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
-                
-                debugMerge("SpillableColumnarBatch created (independent cols)", 
-                  s"""{"spillableId":"${System.identityHashCode(spillable)}","isFromBuffer":false}""")
-                spillable
+                SpillableColumnarBatch(batch, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
               }
             }
           }
         }
         
         // Process in rounds until we have a single result
-        var currentPartials = partialResults
+        var currentPartials: Array[SpillableColumnarBatch] = partialResults.toArray
         var round = 0
         while (currentPartials.length > 1) {
-          debugLog("MERGE", s"Merge round $round", 
-            s"""{"partials":${currentPartials.length}}""")
-          
           val chunks = currentPartials.grouped(CHUNK_SIZE).toArray
           currentPartials = chunks.map(chunk => mergeChunk(chunk))
           round += 1
         }
         
         spillableBatches = currentPartials
-        debugLog("MERGE", "Incremental merge complete", 
-          s"""{"finalRows":${spillableBatches.headOption.map(_.numRows()).getOrElse(0)}}""")
       }
       
       inputBatchesToClose = Array.empty
       
       // Create iterator that returns the merged batch
-      // FIX: Create a completely new batch with deep copied columns to avoid
-      // any lifecycle issues with SpillableColumnarBatch
-      var getIdx = 0
+      // FIX: Must create NEW GpuColumnVectors because spillable.close() will close the original ones
+      // The issue was: incRefCount keeps cudf columns alive, but GpuColumnVector gets closed by spillable
+      // Then downstream can't properly close the cudf columns (GpuColumnVector already closed)
       resultIter = spillableBatches.iterator.map { spillable =>
-        debugLog("MERGE", s"getColumnarBatch called idx=$getIdx", 
-          s"""{"numRows":${spillable.numRows()}}""")
-        
-        // Get the batch from the spillable
         val srcBatch = spillable.getColumnarBatch()
         val numRows = srcBatch.numRows()
         val numCols = srcBatch.numCols()
         
-        // FIX: Create a completely new batch with DEEP COPIED columns
-        // This ensures the returned batch has no shared state with the spillable
+        // FIX: Create NEW GpuColumnVectors that wrap the cudf columns
+        // This ensures proper lifecycle: new GpuColumnVector -> cudf column (with incRefCount)
         val newCols = new Array[GpuColumnVector](numCols)
         for (i <- 0 until numCols) {
-          val gcv = srcBatch.column(i).asInstanceOf[GpuColumnVector]
-          val colView: ai.rapids.cudf.ColumnView = gcv.getBase
-          val copiedCol: ai.rapids.cudf.ColumnVector = colView.copyToColumnVector()
-          newCols(i) = GpuColumnVector.from(copiedCol, gcv.dataType())
+          val srcGcv = srcBatch.column(i).asInstanceOf[GpuColumnVector]
+          val cudfCol = srcGcv.getBase
+          cudfCol.incRefCount() // Keep cudf column alive after spillable.close()
+          // Create NEW GpuColumnVector wrapping the same cudf column
+          newCols(i) = GpuColumnVector.from(cudfCol, srcGcv.dataType())
         }
         
-        // Close the source batch (it came from spillable.getColumnarBatch())
-        srcBatch.close()
-        // Also close the spillable now since we've copied all data
+        // Close spillable - this closes srcBatch and its GpuColumnVectors
+        // But cudf columns survive due to incRefCount
         spillable.close()
         
-        val newBatch = new ColumnarBatch(newCols.toArray, numRows)
-        
-        // #region agent log - H-SHUFFLE: Track batch details for shuffle
-        val colInfo = if (newBatch.numCols() > 0) {
-          val col0 = newBatch.column(0).asInstanceOf[GpuColumnVector]
-          val isFromBuffer = try {
-            GpuColumnVectorFromBuffer.isFromBuffer(newBatch)
-          } catch { case _: Exception => false }
-          s""""col0Type":"${col0.getBase.getType}","isFromBuffer":$isFromBuffer"""
-        } else {
-          """"colInfo":"empty""""
-        }
-        debugLog("MERGE", s"Batch details for shuffle (DEEP COPIED)", 
-          s"""{"numRows":${newBatch.numRows()},"numCols":${newBatch.numCols()},$colInfo,"batchId":"${System.identityHashCode(newBatch)}"}""")
-        // #endregion
-        
-        getIdx += 1
-        newBatch
+        // Return new batch with new GpuColumnVectors
+        // When downstream closes this batch, it will decrement cudf ref counts to 0
+        new ColumnarBatch(newCols.asInstanceOf[Array[org.apache.spark.sql.vectorized.ColumnVector]], numRows)
       }
     } catch {
       case e: Exception =>
-        val errMsg = e.getMessage.replace("\"", "'").take(200)
-        debugLog("ERR", s"Exception in initializeResults", s"""{"error":"$errMsg"}""")
         logError(s"Fused Project + Aggregate failed: ${e.getMessage}", e)
-        allBatches.foreach(_.close())
+        // Clean up any partial results created so far
+        // Note: input batches are closed immediately in the streaming loop
+        partialResults.foreach(_.close())
         throw e
     }
   }
