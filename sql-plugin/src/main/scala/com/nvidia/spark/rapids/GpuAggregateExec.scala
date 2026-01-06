@@ -364,9 +364,14 @@ class AggHelper(
     forceMerge: Boolean,
     conf: SQLConf,
     isSorted: Boolean = false,
-    metrics: Map[String, GpuMetric]) extends Serializable {
+    metrics: Map[String, GpuMetric]) extends Serializable with Logging {
 
   private var doSortAgg = isSorted
+
+  // AST batch project configuration
+  private val rapidsConf = new RapidsConf(conf)
+  private val useAstBatchProject = rapidsConf.isAstBatchProjectEnabled
+  private val astBatchMinExpressions = rapidsConf.astBatchProjectMinExpressions
 
   def setSort(isSorted: Boolean): Unit = {
     doSortAgg = isSorted
@@ -453,6 +458,28 @@ class AggHelper(
   private val postStepBound =
     GpuBindReferences.bindGpuReferencesTiered(postStep.toList, postStepAttr.toList, conf, metrics)
 
+  // Check if AST batch project should be used for pre-step expressions
+  // NOTE: AST batch project is disabled by default because testing shows it provides
+  // negative performance benefit compared to the optimized tiered project.
+  // - 4m dataset: 7% slower than baseline
+  // - 8m dataset: 7% slower than baseline  
+  // The Handwrite Fuse path (fusedTransformAggregate) provides much better gains (1.35-1.78x).
+  private lazy val shouldUseAstBatchProject: Boolean = {
+    if (!useAstBatchProject) {
+      false
+    } else {
+      // Count AST-compatible expressions
+      val boundExprs = preStepBound.exprTiers.flatten
+      val astCompatibleCount = boundExprs.count(AstBatchProject.canConvertToAst)
+      val shouldUse = astCompatibleCount >= astBatchMinExpressions
+      if (shouldUse) {
+        logInfo(s"[AST-BATCH] Enabling AST batch project for pre-step: " +
+          s"$astCompatibleCount/${boundExprs.size} expressions are AST-compatible")
+      }
+      shouldUse
+    }
+  }
+
   /**
    * Apply the "pre" step: preMerge for merge, or pass-through in the update case
    *
@@ -467,11 +494,30 @@ class AggHelper(
       SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
 
     val projectedCb = NvtxRegistry.AGG_PRE_PROCESS {
+      if (shouldUseAstBatchProject) {
+        // Use AST batch project for better kernel batching
+        astBatchPreProject(inputBatch)
+      } else {
+        // Standard tiered project path
       preStepBound.projectAndCloseWithRetrySingleBatch(inputBatch)
+      }
     }
     SpillableColumnarBatch(
       projectedCb,
       SpillPriorities.ACTIVE_BATCHING_PRIORITY)
+  }
+
+  /**
+   * Execute pre-step projection using AST batch compilation.
+   * This batches multiple AST-compatible expressions into fewer kernel launches.
+   */
+  private def astBatchPreProject(inputBatch: SpillableColumnarBatch): ColumnarBatch = {
+    withResource(inputBatch) { sb =>
+      withResource(sb.getColumnarBatch()) { cb =>
+        val boundExprs = preStepBound.exprTiers.flatten
+        AstBatchProject.project(cb, boundExprs)
+      }
+    }
   }
 
   def aggregate(preProcessed: ColumnarBatch, numAggs: GpuMetric): ColumnarBatch = {

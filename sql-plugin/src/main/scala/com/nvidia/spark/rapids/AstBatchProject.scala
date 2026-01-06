@@ -21,7 +21,7 @@ import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
 /**
  * Utility for batching multiple AST-compatible expressions into a single kernel launch.
@@ -150,12 +150,30 @@ object AstBatchProject extends Logging {
       astExprs: Seq[GpuExpression]): ColumnarBatch = {
     
     withResource(GpuColumnVector.from(batch)) { table =>
-      val resultColumns = batchComputeAstColumns(table, astExprs)
-      closeOnExcept(resultColumns) { cols =>
-        val gpuCols = cols.zipWithIndex.map { case (col, idx) =>
-          GpuColumnVector.from(col, astExprs(idx).dataType)
+      // For single-table operations, numFirstTableColumns should be the number of columns
+      // in the input table so that all column references are treated as LEFT table references
+      val numCols = table.getNumberOfColumns
+      val resultColumns = batchComputeAstColumns(table, astExprs, numCols)
+      // GpuColumnVector.from takes ownership of the cudf.ColumnVector, so we need to
+      // track which columns have been wrapped. On exception, only close unwrapped columns.
+      val gpuCols = new Array[GpuColumnVector](resultColumns.length)
+      var i = 0
+      try {
+        while (i < resultColumns.length) {
+          // from() takes ownership - set to null before wrapping to avoid double-close
+          val cudfCol = resultColumns(i)
+          resultColumns(i) = null
+          gpuCols(i) = GpuColumnVector.from(cudfCol, astExprs(i).dataType)
+          i += 1
         }
-        new ColumnarBatch(gpuCols.toArray, batch.numRows())
+        new ColumnarBatch(gpuCols.map(_.asInstanceOf[ColumnVector]), batch.numRows())
+      } catch {
+        case e: Exception =>
+          // Close any GpuColumnVectors we already created
+          gpuCols.filter(_ != null).foreach(_.close())
+          // Close any cudf.ColumnVectors we haven't wrapped yet
+          resultColumns.filter(_ != null).foreach(_.close())
+          throw e
       }
     }
   }
@@ -171,15 +189,28 @@ object AstBatchProject extends Logging {
     
     val resultColumns = new Array[GpuColumnVector](totalExprs)
     
-    closeOnExcept(resultColumns) { _ =>
+    try {
       // Evaluate AST expressions in batch
       if (astExprs.nonEmpty) {
         withResource(GpuColumnVector.from(batch)) { table =>
-          val astResults = batchComputeAstColumns(table, astExprs.map(_._1))
-          closeOnExcept(astResults) { cols =>
-            cols.zip(astExprs).foreach { case (col, (expr, origIdx)) =>
-              resultColumns(origIdx) = GpuColumnVector.from(col, expr.dataType)
+          // For single-table operations, numFirstTableColumns should be the number of columns
+          val numCols = table.getNumberOfColumns
+          val astResults = batchComputeAstColumns(table, astExprs.map(_._1), numCols)
+          // Wrap each column, clearing the array entry to avoid double-close on exception
+          var i = 0
+          try {
+            while (i < astResults.length) {
+              val (expr, origIdx) = astExprs(i)
+              val cudfCol = astResults(i)
+              astResults(i) = null // Clear before wrapping to avoid double-close
+              resultColumns(origIdx) = GpuColumnVector.from(cudfCol, expr.dataType)
+              i += 1
             }
+          } catch {
+            case e: Exception =>
+              // Close any remaining unwrapped cudf columns
+              astResults.filter(_ != null).foreach(_.close())
+              throw e
           }
         }
       }
@@ -188,10 +219,14 @@ object AstBatchProject extends Logging {
       nonAstExprs.foreach { case (expr, origIdx) =>
         resultColumns(origIdx) = expr.columnarEval(batch)
       }
+      
+      new ColumnarBatch(resultColumns.map(_.asInstanceOf[ColumnVector]), batch.numRows())
+    } catch {
+      case e: Exception =>
+        // Close any GpuColumnVectors we created
+        resultColumns.filter(_ != null).foreach(_.close())
+        throw e
     }
-    
-    import org.apache.spark.sql.vectorized.ColumnVector
-    new ColumnarBatch(resultColumns.map(_.asInstanceOf[ColumnVector]), batch.numRows())
   }
 
   /**

@@ -29,8 +29,9 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.rapids.{GpuGreaterThan, GpuMultiply}
 import org.apache.spark.sql.rapids.aggregate.{GpuAggregateExpression, GpuAverage,
-  GpuBasicSum, GpuCount, GpuMax, GpuMin}
+  GpuBasicSum, GpuCount, GpuMax, GpuMin, GpuSum}
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.types.Decimal
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 // =============================================================================
@@ -52,14 +53,66 @@ case class FusionContext(
   /** Get column index, returns None if column doesn't exist */
   def getColIndex(ref: AttributeReference): Option[Int] = colIndexMap.get(ref.exprId)
   
-  /** Try to convert value to Long */
+  /**
+   * Try to convert value to Long.
+   * 
+   * Supports: Long, Int, Short, Byte, Double, Float, BigDecimal, Decimal
+   * For Decimal types: Only converts if value can be represented exactly as Long
+   * (i.e., has no fractional part and is within Long range)
+   */
   def toLong(value: Any): Option[Long] = value match {
     case l: Long => Some(l)
     case i: Int => Some(i.toLong)
     case s: Short => Some(s.toLong)
     case b: Byte => Some(b.toLong)
-    case d: Double => Some(d.toLong)
-    case f: Float => Some(f.toLong)
+    case d: Double => 
+      // Only convert if it's an exact integer value
+      if (d.isWhole && d >= Long.MinValue && d <= Long.MaxValue) Some(d.toLong)
+      else None
+    case f: Float =>
+      // Only convert if it's an exact integer value
+      if (f.isWhole && f >= Long.MinValue && f <= Long.MaxValue) Some(f.toLong)
+      else None
+    // Handle Spark's Decimal type
+    case dec: Decimal =>
+      try {
+        // Check if decimal can be represented as long without losing precision
+        val bd = dec.toJavaBigDecimal
+        if (bd.scale() <= 0 || bd.stripTrailingZeros().scale() <= 0) {
+          // Integer value or value with only trailing zeros
+          val longVal = bd.setScale(0, java.math.RoundingMode.UNNECESSARY).longValueExact()
+          Some(longVal)
+        } else {
+          // Has fractional part - cannot convert to long without losing precision
+          None
+        }
+      } catch {
+        case _: ArithmeticException => None  // Overflow or precision loss
+      }
+    // Handle Java BigDecimal directly
+    case bd: java.math.BigDecimal =>
+      try {
+        if (bd.scale() <= 0 || bd.stripTrailingZeros().scale() <= 0) {
+          val longVal = bd.setScale(0, java.math.RoundingMode.UNNECESSARY).longValueExact()
+          Some(longVal)
+        } else {
+          None
+        }
+      } catch {
+        case _: ArithmeticException => None
+      }
+    // Handle Scala BigDecimal
+    case bd: scala.math.BigDecimal =>
+      try {
+        if (bd.scale <= 0 || bd.underlying().stripTrailingZeros().scale() <= 0) {
+          val longVal = bd.underlying().setScale(0, java.math.RoundingMode.UNNECESSARY).longValueExact()
+          Some(longVal)
+        } else {
+          None
+        }
+      } catch {
+        case _: ArithmeticException => None
+      }
     case _ => None
   }
 }
@@ -142,7 +195,7 @@ object LiteralMatcher extends ExpressionMatcher {
       case GpuLiteral(_, _) =>
         // For COUNT(1), use identity with column 0 and AGG_COUNT
         // This counts all non-null rows which is equivalent to COUNT(1)
-        ctx.builder.addIdentity(0, FusedTransformAggregate.AGG_COUNT)
+        val _ = ctx.builder.addIdentity(0, FusedTransformAggregate.AGG_COUNT)
         true
       case _ => false
     }
@@ -160,8 +213,8 @@ object IdentityMatcher extends ExpressionMatcher {
     expr match {
       case ref: AttributeReference =>
         ctx.getColIndex(ref) match {
-          case Some(idx) =>
-            ctx.builder.addIdentity(idx, ctx.aggOp)
+          case Some(colIdx @ _) =>
+            ctx.builder.addIdentity(colIdx, ctx.aggOp)
             true
           case None => false
         }
@@ -172,19 +225,39 @@ object IdentityMatcher extends ExpressionMatcher {
 
 /**
  * Coalesce matcher - handles COALESCE(col, default) pattern
+ * 
+ * Supports default values of types: Long, Int, Short, Byte, Double, Float, Decimal
+ * For Decimal defaults, only exact integer values are supported (e.g., 0, 1, -1)
+ * Fractional Decimal values cannot be converted to Long for JNI and will cause fallback.
  */
-object CoalesceMatcher extends ExpressionMatcher {
+object CoalesceMatcher extends ExpressionMatcher with Logging {
   override def name: String = "Coalesce"
   override def priority: Int = 30
   
   override def tryMatch(expr: Expression, ctx: FusionContext): Boolean = {
     expr match {
-      case GpuCoalesce(Seq(ref: AttributeReference, GpuLiteral(value, _))) =>
-        (ctx.getColIndex(ref), ctx.toLong(value)) match {
-          case (Some(idx), Some(defaultVal)) =>
-            ctx.builder.addCoalesce(idx, defaultVal, ctx.aggOp)
+      case GpuCoalesce(Seq(ref: AttributeReference, GpuLiteral(value, dataType))) =>
+        val colIdx = ctx.getColIndex(ref)
+        val longVal = ctx.toLong(value)
+        
+        (colIdx, longVal) match {
+          case (Some(cIdx @ _), Some(defVal @ _)) =>
+            ctx.builder.addCoalesce(cIdx, defVal, ctx.aggOp)
             true
-          case _ => false
+          case (None, _) =>
+            logDebug(s"[FUSION] CoalesceMatcher: column ${ref.name} not found in colIndexMap")
+            false
+          case (_, None) =>
+            // Detailed logging for debugging Decimal conversion issues
+            val valueInfo = value match {
+              case d: Decimal => s"Decimal(${d.toString}, precision=${d.precision}, scale=${d.scale})"
+              case bd: java.math.BigDecimal => s"BigDecimal(${bd.toString}, scale=${bd.scale})"
+              case other => s"${other.getClass.getSimpleName}($other)"
+            }
+            logDebug(s"[FUSION] CoalesceMatcher: cannot convert default value to Long: " +
+              s"value=$valueInfo, dataType=$dataType. " +
+              "Only integer-representable values are supported for fusion.")
+            false
         }
       case _ => false
     }
@@ -206,8 +279,8 @@ object CoalesceMulSelfMatcher extends ExpressionMatcher {
           GpuCoalesce(Seq(ref2: AttributeReference, lit2 @ GpuLiteral(_, _))), _) 
           if ref1.exprId == ref2.exprId && lit1 == lit2 =>
         (ctx.getColIndex(ref1), ctx.toLong(v1)) match {
-          case (Some(idx), Some(defaultVal)) =>
-            ctx.builder.addCoalesceMulSelf(idx, defaultVal, ctx.aggOp)
+          case (Some(colIdx @ _), Some(defVal @ _)) =>
+            ctx.builder.addCoalesceMulSelf(colIdx, defVal, ctx.aggOp)
             true
           case _ => false
         }
@@ -230,8 +303,8 @@ object CoalesceMulOtherMatcher extends ExpressionMatcher {
           GpuCoalesce(Seq(ref1: AttributeReference, GpuLiteral(v1, _))),
           GpuCoalesce(Seq(ref2: AttributeReference, GpuLiteral(_, _))), _) =>
         (ctx.getColIndex(ref1), ctx.getColIndex(ref2), ctx.toLong(v1)) match {
-          case (Some(idx1), Some(idx2), Some(defaultVal)) =>
-            ctx.builder.addCoalesceMulOther(idx1, idx2, defaultVal, ctx.aggOp)
+          case (Some(idx1 @ _), Some(idx2 @ _), Some(defVal @ _)) =>
+            ctx.builder.addCoalesceMulOther(idx1, idx2, defVal, ctx.aggOp)
             true
           case _ => false
         }
@@ -256,8 +329,8 @@ object ConditionalMatcher extends ExpressionMatcher {
           GpuLiteral(elseVal, _)) =>
         (ctx.getColIndex(valRef), ctx.getColIndex(condRef),
          ctx.toLong(threshold), ctx.toLong(elseVal)) match {
-          case (Some(valIdx), Some(condIdx), Some(thresh), Some(elseV)) =>
-            ctx.builder.addConditional(valIdx, condIdx, thresh, elseV, ctx.aggOp)
+          case (Some(vIdx @ _), Some(cIdx @ _), Some(thr @ _), Some(elV @ _)) =>
+            ctx.builder.addConditional(vIdx, cIdx, thr, elV, ctx.aggOp)
             true
           case _ => false
         }
@@ -268,8 +341,8 @@ object ConditionalMatcher extends ExpressionMatcher {
           Some(GpuLiteral(elseVal, _)), _) =>
         (ctx.getColIndex(valRef), ctx.getColIndex(condRef),
          ctx.toLong(threshold), ctx.toLong(elseVal)) match {
-          case (Some(valIdx), Some(condIdx), Some(thresh), Some(elseV)) =>
-            ctx.builder.addConditional(valIdx, condIdx, thresh, elseV, ctx.aggOp)
+          case (Some(vIdx @ _), Some(cIdx @ _), Some(thr @ _), Some(elV @ _)) =>
+            ctx.builder.addConditional(vIdx, cIdx, thr, elV, ctx.aggOp)
             true
           case _ => false
         }
@@ -294,8 +367,8 @@ object ConditionalCoalesceMatcher extends ExpressionMatcher {
           GpuLiteral(elseVal, _)) =>
         (ctx.getColIndex(valRef), ctx.getColIndex(condRef),
          ctx.toLong(threshold), ctx.toLong(defaultVal), ctx.toLong(elseVal)) match {
-          case (Some(valIdx), Some(condIdx), Some(thresh), Some(defVal), Some(elseV)) =>
-            ctx.builder.addConditionalCoalesce(valIdx, condIdx, thresh, defVal, elseV, ctx.aggOp)
+          case (Some(vIdx @ _), Some(cIdx @ _), Some(thr @ _), Some(dVal @ _), Some(elV @ _)) =>
+            ctx.builder.addConditionalCoalesce(vIdx, cIdx, thr, dVal, elV, ctx.aggOp)
             true
           case _ => false
         }
@@ -306,8 +379,8 @@ object ConditionalCoalesceMatcher extends ExpressionMatcher {
           Some(GpuLiteral(elseVal, _)), _) =>
         (ctx.getColIndex(valRef), ctx.getColIndex(condRef),
          ctx.toLong(threshold), ctx.toLong(defaultVal), ctx.toLong(elseVal)) match {
-          case (Some(valIdx), Some(condIdx), Some(thresh), Some(defVal), Some(elseV)) =>
-            ctx.builder.addConditionalCoalesce(valIdx, condIdx, thresh, defVal, elseV, ctx.aggOp)
+          case (Some(vIdx @ _), Some(cIdx @ _), Some(thr @ _), Some(dVal @ _), Some(elV @ _)) =>
+            ctx.builder.addConditionalCoalesce(vIdx, cIdx, thr, dVal, elV, ctx.aggOp)
             true
           case _ => false
         }
@@ -350,8 +423,8 @@ object CastCoalesceMulSelfMatcher extends ExpressionMatcher {
           GpuCast(GpuCoalesce(Seq(ref2: AttributeReference, GpuLiteral(_, _))),
             _, _, _, _, _), _) if ref1.exprId == ref2.exprId =>
         (ctx.getColIndex(ref1), ctx.toLong(v1)) match {
-          case (Some(idx), Some(defaultVal)) =>
-            ctx.builder.addCoalesceMulSelf(idx, defaultVal, ctx.aggOp)
+          case (Some(colIdx @ _), Some(defVal @ _)) =>
+            ctx.builder.addCoalesceMulSelf(colIdx, defVal, ctx.aggOp)
             true
           case _ => false
         }
@@ -376,8 +449,8 @@ object CastCoalesceMulOtherMatcher extends ExpressionMatcher {
           GpuCast(GpuCoalesce(Seq(ref2: AttributeReference, GpuLiteral(_, _))),
             _, _, _, _, _), _) =>
         (ctx.getColIndex(ref1), ctx.getColIndex(ref2), ctx.toLong(v1)) match {
-          case (Some(idx1), Some(idx2), Some(defaultVal)) =>
-            ctx.builder.addCoalesceMulOther(idx1, idx2, defaultVal, ctx.aggOp)
+          case (Some(col1 @ _), Some(col2 @ _), Some(defVal @ _)) =>
+            ctx.builder.addCoalesceMulOther(col1, col2, defVal, ctx.aggOp)
             true
           case _ => false
         }
@@ -663,73 +736,145 @@ object GpuFusedProjectAggregate extends Logging {
   }
   
   /**
-   * Check if an expression matches the fusable patterns.
+   * Check if a GpuLiteral value can be converted to Long.
+   * This is essential for planning phase to correctly identify unsupported patterns.
+   * 
+   * Only values that can be exactly represented as Long are supported for fusion.
+   * Fractional Decimal values cannot be converted and will cause fusion to be rejected.
    */
+  private def isLiteralConvertibleToLong(lit: GpuLiteral): Boolean = {
+    lit.value match {
+      case null => true  // null is handled by coalesce
+      case _: Long | _: Int | _: Short | _: Byte => true
+      case d: Double => d.isWhole && d >= Long.MinValue && d <= Long.MaxValue
+      case f: Float => f.isWhole && f >= Long.MinValue && f <= Long.MaxValue
+      case dec: Decimal =>
+        try {
+          val bd = dec.toJavaBigDecimal
+          bd.scale() <= 0 || bd.stripTrailingZeros().scale() <= 0
+        } catch {
+          case _: Exception => false
+        }
+      case bd: java.math.BigDecimal =>
+        try {
+          bd.scale() <= 0 || bd.stripTrailingZeros().scale() <= 0
+        } catch {
+          case _: Exception => false
+        }
+      case _ => false
+    }
+  }
+
+  /**
+   * Check if an expression matches the fusable patterns.
+   * 
+   * This method validates both the expression structure AND the literal values.
+   * Literals must be convertible to Long for the JNI interface.
+   */
+  /**
+   * Check if a data type is supported by the fused JNI kernel.
+   * 
+   * Supported types:
+   * - Integer types: INT64, INT32, INT16, INT8
+   * - Floating point: FLOAT64, FLOAT32
+   * - Boolean: BOOL8
+   * - Decimal: DECIMAL64 (precision <= 18) - stored as scaled int64
+   * 
+   * DECIMAL128 (precision > 18) is NOT supported because:
+   * - JNI kernel uses atomicAdd which doesn't support 128-bit integers
+   * - Would require custom atomic implementation or different aggregation strategy
+   */
+  private[rapids] def isSupportedDataType(dt: DataType): Boolean = dt match {
+    case LongType | IntegerType | ShortType | ByteType => true
+    case DoubleType | FloatType => true
+    case BooleanType => true
+    // DECIMAL64 (precision <= 18) can be handled as int64 with scaled values
+    // DECIMAL128 (precision > 18) is NOT supported - atomicAdd doesn't support 128-bit
+    case dt: DecimalType => dt.precision <= Decimal.MAX_LONG_DIGITS // 18
+    case _ => false
+  }
+  
   private def isFusableExpression(expr: Expression): Boolean = {
     expr match {
-      // Simple column reference
-      case _: AttributeReference => true
-      case _: GpuBoundReference => true
+      // Simple column reference - must also check data type
+      case ref: AttributeReference => isSupportedDataType(ref.dataType)
+      case ref: GpuBoundReference => isSupportedDataType(ref.dataType)
       
       // CAST: CAST(inner AS type) - unwrap and check inner
       case GpuCast(inner, _, _, _, _, _) => isFusableExpression(inner)
       
-      // Coalesce: COALESCE(col, literal)
-      case GpuCoalesce(Seq(_: AttributeReference, _: GpuLiteral)) => true
-      case GpuCoalesce(Seq(_: GpuBoundReference, _: GpuLiteral)) => true
+      // Coalesce: COALESCE(col, literal) - also check literal is convertible
+      case GpuCoalesce(Seq(_: AttributeReference, lit: GpuLiteral)) => 
+        isLiteralConvertibleToLong(lit)
+      case GpuCoalesce(Seq(_: GpuBoundReference, lit: GpuLiteral)) => 
+        isLiteralConvertibleToLong(lit)
       // Coalesce with CAST: COALESCE(CAST(col), literal)
-      case GpuCoalesce(Seq(GpuCast(_, _, _, _, _, _), _: GpuLiteral)) => true
+      case GpuCoalesce(Seq(GpuCast(_, _, _, _, _, _), lit: GpuLiteral)) => 
+        isLiteralConvertibleToLong(lit)
       
       // CoalesceMulSelf: COALESCE(col, d) * COALESCE(col, d)
       case GpuMultiply(
-          GpuCoalesce(Seq(ref1: AttributeReference, lit1 @ GpuLiteral(_, _))),
-          GpuCoalesce(Seq(ref2: AttributeReference, lit2 @ GpuLiteral(_, _))), _) 
-          if ref1.exprId == ref2.exprId && lit1 == lit2 => true
+          GpuCoalesce(Seq(ref1: AttributeReference, lit1: GpuLiteral)),
+          GpuCoalesce(Seq(ref2: AttributeReference, lit2: GpuLiteral)), _) 
+          if ref1.exprId == ref2.exprId && lit1 == lit2 => 
+        isLiteralConvertibleToLong(lit1)
       
       // CoalesceMulOther: COALESCE(col1, d) * COALESCE(col2, d)
       case GpuMultiply(
-          GpuCoalesce(Seq(_: AttributeReference, _: GpuLiteral)),
-          GpuCoalesce(Seq(_: AttributeReference, _: GpuLiteral)), _) => true
+          GpuCoalesce(Seq(_: AttributeReference, lit1: GpuLiteral)),
+          GpuCoalesce(Seq(_: AttributeReference, lit2: GpuLiteral)), _) => 
+        isLiteralConvertibleToLong(lit1) && isLiteralConvertibleToLong(lit2)
       
       // CAST(COALESCE) * CAST(COALESCE): for patterns like CAST(COALESCE(x,0) AS DOUBLE) * CAST(...)
       case GpuMultiply(
-          GpuCast(GpuCoalesce(Seq(_: AttributeReference, _: GpuLiteral)), _, _, _, _, _),
-          GpuCast(GpuCoalesce(Seq(_: AttributeReference, _: GpuLiteral)), _, _, _, _, _), _) => true
+          GpuCast(GpuCoalesce(Seq(_: AttributeReference, lit1: GpuLiteral)), _, _, _, _, _),
+          GpuCast(GpuCoalesce(Seq(_: AttributeReference, lit2: GpuLiteral)), _, _, _, _, _), _) => 
+        isLiteralConvertibleToLong(lit1) && isLiteralConvertibleToLong(lit2)
       
       // Conditional: IF(cond > threshold, col, elseVal)
       case GpuIf(
-          GpuGreaterThan(_: AttributeReference, _: GpuLiteral),
+          GpuGreaterThan(_: AttributeReference, threshLit: GpuLiteral),
           _: AttributeReference,
-          _: GpuLiteral) => true
+          elseLit: GpuLiteral) => 
+        isLiteralConvertibleToLong(threshLit) && isLiteralConvertibleToLong(elseLit)
       
       // Conditional with coalesce
       case GpuIf(
-          GpuGreaterThan(_: AttributeReference, _: GpuLiteral),
-          GpuCoalesce(Seq(_: AttributeReference, _: GpuLiteral)),
-          _: GpuLiteral) => true
+          GpuGreaterThan(_: AttributeReference, threshLit: GpuLiteral),
+          GpuCoalesce(Seq(_: AttributeReference, defLit: GpuLiteral)),
+          elseLit: GpuLiteral) => 
+        isLiteralConvertibleToLong(threshLit) && 
+        isLiteralConvertibleToLong(defLit) && 
+        isLiteralConvertibleToLong(elseLit)
       
       // Nested coalesce * coalesce on conditional result
       case GpuMultiply(
-          GpuCoalesce(Seq(GpuIf(_, _, _), _: GpuLiteral)),
-          GpuCoalesce(Seq(GpuIf(_, _, _), _: GpuLiteral)), _) => true
+          GpuCoalesce(Seq(GpuIf(_, _, _), lit1: GpuLiteral)),
+          GpuCoalesce(Seq(GpuIf(_, _, _), lit2: GpuLiteral)), _) => 
+        isLiteralConvertibleToLong(lit1) && isLiteralConvertibleToLong(lit2)
       
       // GpuCaseWhen with single branch - equivalent to IF(cond, then, else)
       // Pattern: CASE WHEN cond > threshold THEN col ELSE literal END
       case GpuCaseWhen(
-          Seq((GpuGreaterThan(_: AttributeReference, _: GpuLiteral), _: AttributeReference)),
-          Some(_: GpuLiteral), _) => true
+          Seq((GpuGreaterThan(_: AttributeReference, threshLit: GpuLiteral), _: AttributeReference)),
+          Some(elseLit: GpuLiteral), _) => 
+        isLiteralConvertibleToLong(threshLit) && isLiteralConvertibleToLong(elseLit)
       
       // GpuCaseWhen with coalesce in then branch
       // Pattern: CASE WHEN cond > threshold THEN COALESCE(col, d) ELSE literal END
       case GpuCaseWhen(
-          Seq((GpuGreaterThan(_: AttributeReference, _: GpuLiteral), 
-               GpuCoalesce(Seq(_: AttributeReference, _: GpuLiteral)))),
-          Some(_: GpuLiteral), _) => true
+          Seq((GpuGreaterThan(_: AttributeReference, threshLit: GpuLiteral), 
+               GpuCoalesce(Seq(_: AttributeReference, defLit: GpuLiteral)))),
+          Some(elseLit: GpuLiteral), _) => 
+        isLiteralConvertibleToLong(threshLit) && 
+        isLiteralConvertibleToLong(defLit) && 
+        isLiteralConvertibleToLong(elseLit)
       
       // Nested coalesce * coalesce on CaseWhen result
       case GpuMultiply(
-          GpuCoalesce(Seq(GpuCaseWhen(_, _, _), _: GpuLiteral)),
-          GpuCoalesce(Seq(GpuCaseWhen(_, _, _), _: GpuLiteral)), _) => true
+          GpuCoalesce(Seq(GpuCaseWhen(_, _, _), lit1: GpuLiteral)),
+          GpuCoalesce(Seq(GpuCaseWhen(_, _, _), lit2: GpuLiteral)), _) => 
+        isLiteralConvertibleToLong(lit1) && isLiteralConvertibleToLong(lit2)
           
       case _ => false
     }
@@ -775,7 +920,8 @@ object GpuFusedProjectAggregate extends Logging {
         }
         
         if (!allFusable || fusedCount == 0) {
-          logWarning(s"[FUSION-EXEC] Cannot fuse: allFusable=$allFusable, fusedCount=$fusedCount/${aggExprs.size}")
+          logWarning(s"[FUSION-EXEC] Cannot fuse: allFusable=$allFusable, " +
+            s"fusedCount=$fusedCount/${aggExprs.size}")
           return None
         }
         
@@ -923,10 +1069,12 @@ object GpuFusedProjectAggregate extends Logging {
         aggInput match {
           case ref: AttributeReference =>
             // First add SUM expression
-            val sumOk = analyzeAndAddExpression(builder, ref, projectExprs, colIndexMap, AGG_SUM)
+            val sumOk = analyzeAndAddExpression(
+              builder, ref, projectExprs, colIndexMap, AGG_SUM)
             if (!sumOk) return false
             // Then add COUNT expression  
-            val countOk = analyzeAndAddExpression(builder, ref, projectExprs, colIndexMap, AGG_COUNT)
+            val countOk = analyzeAndAddExpression(
+              builder, ref, projectExprs, colIndexMap, AGG_COUNT)
             return countOk
           case _ =>
             return false
@@ -935,8 +1083,10 @@ object GpuFusedProjectAggregate extends Logging {
     }
     
     // Get the aggregation operation type
+    // Use abstract classes GpuSum/GpuMin/GpuMax to match all subclasses
+    // (e.g., GpuBasicSum, GpuDecimal128Sum, GpuBasicMin, GpuFloatMin, etc.)
     val aggOp = aggExpr.aggregateFunction match {
-      case _: GpuBasicSum => AGG_SUM
+      case _: GpuSum => AGG_SUM
       case _: GpuCount => AGG_COUNT
       case _: GpuMin => AGG_MIN
       case _: GpuMax => AGG_MAX
@@ -1003,8 +1153,8 @@ object GpuFusedProjectAggregate extends Logging {
         analyzeProjectChild(builder, child, colIndexMap, aggOp)
       case Some(a: AttributeReference) =>
         colIndexMap.get(a.exprId) match {
-          case Some(idx) =>
-            builder.addIdentity(idx, aggOp)
+          case Some(colIdx @ _) =>
+            builder.addIdentity(colIdx, aggOp)
             true
           case None => 
             false
@@ -1058,8 +1208,10 @@ object GpuFusedProjectAggregate extends Logging {
         case GpuMultiply(
             GpuCoalesce(Seq(ref1: AttributeReference, _)),
             GpuCoalesce(Seq(ref2: AttributeReference, _)), _) =>
-          logWarning(s"[FUSION] Multiply match attempt: ref1.exprId=${ref1.exprId.id}, ref2.exprId=${ref2.exprId.id}, " +
-            s"ref1 in map=${colIndexMap.contains(ref1.exprId)}, ref2 in map=${colIndexMap.contains(ref2.exprId)}")
+          logWarning(s"[FUSION] Multiply match attempt: " +
+            s"ref1.exprId=${ref1.exprId.id}, ref2.exprId=${ref2.exprId.id}, " +
+            s"ref1 in map=${colIndexMap.contains(ref1.exprId)}, " +
+            s"ref2 in map=${colIndexMap.contains(ref2.exprId)}")
         case _ =>
       }
     }
@@ -1095,13 +1247,15 @@ object GpuFusedProjectAggregate extends Logging {
     }
     
     // Get the aggregation operation type
+    // Use abstract classes GpuSum/GpuMin/GpuMax to match all subclasses
     val aggOp = aggExpr.aggregateFunction match {
-      case _: GpuBasicSum => AGG_SUM
+      case _: GpuSum => AGG_SUM
       case _: GpuCount => AGG_COUNT
       case _: GpuMin => AGG_MIN
       case _: GpuMax => AGG_MAX
       case _ => 
-        logDebug(s"Unsupported aggregate function: ${aggExpr.aggregateFunction.getClass.getSimpleName}")
+        val funcName = aggExpr.aggregateFunction.getClass.getSimpleName
+        logDebug(s"Unsupported aggregate function: $funcName")
         return false
     }
     
@@ -1194,27 +1348,40 @@ object GpuFusedProjectAggregate extends Logging {
           // internal cuDF state with the source table.
           val gpuVectors = new Array[GpuColumnVector](numKeyCols + numValCols)
           
+          // Helper to convert cuDF DType to Spark DataType
+          def cudfTypeToSpark(cudfType: ai.rapids.cudf.DType): DataType = cudfType match {
+            case ai.rapids.cudf.DType.INT64 => LongType
+            case ai.rapids.cudf.DType.FLOAT64 => DoubleType
+            case ai.rapids.cudf.DType.INT32 => IntegerType
+            case ai.rapids.cudf.DType.FLOAT32 => FloatType
+            case ai.rapids.cudf.DType.INT16 => ShortType
+            case ai.rapids.cudf.DType.INT8 => ByteType
+            case ai.rapids.cudf.DType.BOOL8 => BooleanType
+            case dt if dt.isDecimalType =>
+              // DECIMAL64 or DECIMAL128 - get precision and scale
+              // Scale in cuDF can be negative for large numbers
+              val scale = -dt.getScale  // cuDF uses negative scale
+              val precision = if (dt.getTypeId == ai.rapids.cudf.DType.DTypeEnum.DECIMAL128) {
+                38  // Max precision for DECIMAL128
+              } else {
+                18  // Max precision for DECIMAL64
+              }
+              DecimalType(precision, math.max(0, scale))
+            case other =>
+              throw new UnsupportedOperationException(s"Unsupported cuDF type: $other")
+          }
+          
           for (i <- 0 until numKeyCols) {
             val colView: ai.rapids.cudf.ColumnView = keysTable.getColumn(i)
             val copiedCol: ai.rapids.cudf.ColumnVector = colView.copyToColumnVector()
-            val dt = copiedCol.getType match {
-              case ai.rapids.cudf.DType.INT64 => LongType
-              case ai.rapids.cudf.DType.FLOAT64 => DoubleType
-              case ai.rapids.cudf.DType.INT32 => IntegerType
-              case other => throw new UnsupportedOperationException(s"Unsupported key type: $other")
-            }
+            val dt = cudfTypeToSpark(copiedCol.getType)
             gpuVectors(i) = GpuColumnVector.from(copiedCol, dt)
           }
           
           for (i <- 0 until numValCols) {
             val colView: ai.rapids.cudf.ColumnView = valuesTable.getColumn(i)
             val copiedCol: ai.rapids.cudf.ColumnVector = colView.copyToColumnVector()
-            val dt = copiedCol.getType match {
-              case ai.rapids.cudf.DType.INT64 => LongType
-              case ai.rapids.cudf.DType.FLOAT64 => DoubleType
-              case ai.rapids.cudf.DType.INT32 => IntegerType
-              case other => throw new UnsupportedOperationException(s"Unsupported value type: $other")
-            }
+            val dt = cudfTypeToSpark(copiedCol.getType)
             gpuVectors(numKeyCols + i) = GpuColumnVector.from(copiedCol, dt)
           }
           
@@ -1228,6 +1395,26 @@ object GpuFusedProjectAggregate extends Logging {
     }
     } // end NvtxRange
   }
+}
+
+/**
+ * Merge operation type for partial aggregation results.
+ * Each partial column needs to know how to merge with other partials.
+ */
+sealed trait MergeAggType {
+  def toCudfAggregation: ai.rapids.cudf.GroupByAggregation
+}
+case object MergeSum extends MergeAggType {
+  override def toCudfAggregation: ai.rapids.cudf.GroupByAggregation = 
+    ai.rapids.cudf.GroupByAggregation.sum()
+}
+case object MergeMin extends MergeAggType {
+  override def toCudfAggregation: ai.rapids.cudf.GroupByAggregation = 
+    ai.rapids.cudf.GroupByAggregation.min()
+}
+case object MergeMax extends MergeAggType {
+  override def toCudfAggregation: ai.rapids.cudf.GroupByAggregation = 
+    ai.rapids.cudf.GroupByAggregation.max()
 }
 
 /**
@@ -1252,14 +1439,42 @@ class GpuFusedProjectAggregateIterator(
   private var resultIter: Iterator[ColumnarBatch] = Iterator.empty
   private var initialized = false
   
-  // Keep strong references to prevent GC from closing resources prematurely
-  // These will be closed when the iterator is exhausted
+  // Track spillable batches for proper cleanup if iterator is not fully consumed
   private var spillableBatches: Array[SpillableColumnarBatch] = Array.empty
-  private var inputBatchesToClose: Array[ColumnarBatch] = Array.empty
-  private var currentResultIdx = 0
   
   // Metric to track fused batches - exposed for testing
   private val fusedBatchesMetric = allMetrics.get("NUM_FUSED_BATCHES")
+  
+  /**
+   * Build merge operation types for each output aggregate column.
+   * This tells the merge phase how to correctly combine partial results.
+   * 
+   * CRITICAL: Different aggregates need different merge operations:
+   * - SUM partial results → merge with SUM
+   * - COUNT partial results → merge with SUM (COUNT is SUM of counts)
+   * - MIN partial results → merge with MIN
+   * - MAX partial results → merge with MAX
+   * - AVG is expanded to (SUM, COUNT), both merge with SUM
+   */
+  private val mergeAggTypes: Seq[MergeAggType] = {
+    aggregateExprs.flatMap { aggExpr =>
+      aggExpr.aggregateFunction match {
+        case _: GpuAverage =>
+          // AVG is expanded to 2 columns: SUM and COUNT
+          // Both merge with SUM (COUNT partials are summed)
+          Seq(MergeSum, MergeSum)
+        case _: GpuBasicSum | _: GpuCount =>
+          Seq(MergeSum)
+        case _: GpuMin =>
+          Seq(MergeMin)
+        case _: GpuMax =>
+          Seq(MergeMax)
+        case _ =>
+          // Fallback - should not happen if planning is correct
+          Seq(MergeSum)
+      }
+    }
+  }
 
   override def hasNext: Boolean = {
     if (!initialized) {
@@ -1275,38 +1490,11 @@ class GpuFusedProjectAggregateIterator(
       initialized = true
     }
     
-    // Close previous batch's resources if any (deferred close)
-    closePreviousBatchResources()
-    
     val batch = resultIter.next()
-    currentResultIdx += 1
     metrics.numOutputRows += batch.numRows()
     metrics.numOutputBatches += 1
     
-    // FIX: Ensure all GPU operations are complete before returning batch to shuffle
-    // This prevents any async GPU operations from corrupting data during D2H copy
-    ai.rapids.cudf.Cuda.DEFAULT_STREAM.sync()
-    
-    // When iterator is exhausted, schedule cleanup for next call or finalization
-    if (!resultIter.hasNext) {
-      // Mark that we should close everything on next access or finalization
-      allConsumed = true
-    }
     batch
-  }
-  
-  private var allConsumed = false
-  private var lastClosedIdx = -1
-  
-  private def closePreviousBatchResources(): Unit = {
-    // H7: Temporarily disable closing input batches to test if this is causing the crash
-    // The input batches will be closed when the task completes (task cleanup)
-    // This may cause higher memory usage but will help isolate the root cause
-    val _ = (inputBatchesToClose, allConsumed)  // suppress unused warnings
-    lastClosedIdx = lastClosedIdx  // suppress "never updated" warning
-    
-    // DISABLED for debugging - don't close any batches
-    // if (currentResultIdx > 0 && lastClosedIdx < currentResultIdx - 1) { ... }
   }
 
   private def initializeResults(): Unit = {
@@ -1372,45 +1560,16 @@ class GpuFusedProjectAggregateIterator(
       } else {
         
         // Incremental merge: process in chunks to avoid OOM
-        val CHUNK_SIZE = 10  // Merge 10 partials at a time
+        // Increased chunk size to reduce merge rounds (was 10, now 32)
+        val CHUNK_SIZE = 32
         val numGroupCols = groupingExprs.length
         val groupByIndices = (0 until numGroupCols).toArray
         
         def mergeChunk(chunk: Array[SpillableColumnarBatch]): SpillableColumnarBatch = {
-          // Handle single-element chunk - need to create DEEP COPY columns to avoid
-          // memory sharing issues when this batch is later used in merge rounds
+          // Handle single-element chunk - just return as-is without deep copy
+          // Deep copy will be done in final iteration when creating result batch
           if (chunk.length == 1) {
-            val oldSpillable = chunk(0)
-            
-            // Get the batch from spillable
-            val batch = oldSpillable.getColumnarBatch()
-            val numRows = batch.numRows()
-            val numCols = batch.numCols()
-            
-            // FIX: Create table, copy columns, then let withResource close table properly
-            // DO NOT close batch inside withResource - table shares column refs with batch
-            val newGpuVectors = withResource(GpuColumnVector.from(batch)) { table =>
-              val vectors = new Array[GpuColumnVector](numCols)
-              for (i <- 0 until numCols) {
-                val colView: ai.rapids.cudf.ColumnView = table.getColumn(i)
-                val copiedCol: ai.rapids.cudf.ColumnVector = colView.copyToColumnVector()
-                val dt = copiedCol.getType match {
-                  case ai.rapids.cudf.DType.INT64 => LongType
-                  case ai.rapids.cudf.DType.FLOAT64 => DoubleType
-                  case ai.rapids.cudf.DType.INT32 => IntegerType
-                  case other => throw new UnsupportedOperationException(s"Unsupported type in single chunk: $other")
-                }
-                vectors(i) = GpuColumnVector.from(copiedCol, dt)
-              }
-              vectors
-            } // table closed here, which decrements ref counts on batch columns
-            
-            // FIX: Only close spillable - it owns the batch and will close it
-            // DO NOT close batch separately - that causes double-free
-            oldSpillable.close()
-            
-            val newBatch = new ColumnarBatch(newGpuVectors.toArray, numRows)
-            return SpillableColumnarBatch(newBatch, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
+            return chunk(0)
           }
           
           withResource(new NvtxRange("MergeChunk", NvtxColor.YELLOW)) { _ =>
@@ -1432,8 +1591,20 @@ class GpuFusedProjectAggregateIterator(
             
             
             withResource(concatenated) { concatTable =>
-              val aggSpecs = (numGroupCols until concatTable.getNumberOfColumns).map { colIdx =>
-                ai.rapids.cudf.GroupByAggregation.sum().onColumn(colIdx)
+              // FIX: Use correct merge aggregation based on original aggregate type
+              // Different aggregates need different merge operations:
+              // - SUM/COUNT partials → merge with SUM
+              // - MIN partials → merge with MIN  
+              // - MAX partials → merge with MAX
+              val aggSpecs = (numGroupCols until concatTable.getNumberOfColumns).zipWithIndex.map { 
+                case (colIdx, aggIdx) =>
+                  val mergeType = if (aggIdx < mergeAggTypes.length) {
+                    mergeAggTypes(aggIdx)
+                  } else {
+                    logWarning(s"[FUSION-MERGE] No merge type for col $aggIdx, default SUM")
+                    MergeSum
+                  }
+                  mergeType.toCudfAggregation.onColumn(colIdx)
               }
               val groupOptions = ai.rapids.cudf.GroupByOptions.builder()
                 .withIgnoreNullKeys(false).build()
@@ -1457,11 +1628,24 @@ class GpuFusedProjectAggregateIterator(
                   // ColumnView.copyToColumnVector() creates a true deep copy with new memory
                   val colView: ai.rapids.cudf.ColumnView = mergedTable.getColumn(i)
                   val copiedCol: ai.rapids.cudf.ColumnVector = colView.copyToColumnVector()
-                  val dt = copiedCol.getType match {
+                  val cudfType = copiedCol.getType
+                  val dt = cudfType match {
                     case ai.rapids.cudf.DType.INT64 => LongType
                     case ai.rapids.cudf.DType.FLOAT64 => DoubleType
                     case ai.rapids.cudf.DType.INT32 => IntegerType
-                    case other => throw new UnsupportedOperationException(s"Unsupported type: $other")
+                    case ai.rapids.cudf.DType.FLOAT32 => FloatType
+                    case ai.rapids.cudf.DType.INT16 => ShortType
+                    case ai.rapids.cudf.DType.INT8 => ByteType
+                    case ai.rapids.cudf.DType.BOOL8 => BooleanType
+                    case t if t.isDecimalType =>
+                      // DECIMAL64 or DECIMAL128 - preserve precision and scale
+                      val scale = -t.getScale  // cuDF uses negative scale
+                      val isDecimal128 = 
+                        t.getTypeId == ai.rapids.cudf.DType.DTypeEnum.DECIMAL128
+                      val precision = if (isDecimal128) 38 else 18
+                      DecimalType(precision, math.max(0, scale))
+                    case other => 
+                      throw new UnsupportedOperationException(s"Unsupported: $other")
                   }
                   gpuVectors(i) = GpuColumnVector.from(copiedCol, dt)
                 }
@@ -1485,12 +1669,10 @@ class GpuFusedProjectAggregateIterator(
         spillableBatches = currentPartials
       }
       
-      inputBatchesToClose = Array.empty
-      
       // Create iterator that returns the merged batch
-      // FIX: Must create NEW GpuColumnVectors because spillable.close() will close the original ones
-      // The issue was: incRefCount keeps cudf columns alive, but GpuColumnVector gets closed by spillable
-      // Then downstream can't properly close the cudf columns (GpuColumnVector already closed)
+      // FIX: Must create NEW GpuColumnVectors because spillable.close()
+      // will close the original ones. incRefCount keeps cudf columns alive,
+      // but GpuColumnVector gets closed by spillable.
       resultIter = spillableBatches.iterator.map { spillable =>
         val srcBatch = spillable.getColumnarBatch()
         val numRows = srcBatch.numRows()
@@ -1512,8 +1694,10 @@ class GpuFusedProjectAggregateIterator(
         spillable.close()
         
         // Return new batch with new GpuColumnVectors
-        // When downstream closes this batch, it will decrement cudf ref counts to 0
-        new ColumnarBatch(newCols.asInstanceOf[Array[org.apache.spark.sql.vectorized.ColumnVector]], numRows)
+        // When downstream closes this batch, it decrements cudf ref counts to 0
+        val colArray = newCols.asInstanceOf[Array[
+          org.apache.spark.sql.vectorized.ColumnVector]]
+        new ColumnarBatch(colArray, numRows)
       }
     } catch {
       case e: Exception =>

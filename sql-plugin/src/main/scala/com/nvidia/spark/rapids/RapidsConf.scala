@@ -1304,9 +1304,10 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
 
   val ENABLE_AST_BATCH_PROJECT = conf("spark.rapids.sql.aggregate.astBatchProject.enabled")
       .doc("Enable AST batch compilation for pre-project expressions in aggregation. " +
-        "This batches multiple AST-compatible expressions into fewer kernel launches, " +
-        "which is particularly effective for workloads with many aggregations like " +
-        "variance/covariance calculations.")
+        "This batches multiple AST-compatible expressions into fewer kernel launches. " +
+        "WARNING: Testing shows this provides negative performance benefit (7% slower) " +
+        "compared to the optimized tiered project. Use fusedTransformAggregate instead " +
+        "for better performance (1.35-1.78x speedup).")
       .booleanConf
       .createWithDefault(false)
 

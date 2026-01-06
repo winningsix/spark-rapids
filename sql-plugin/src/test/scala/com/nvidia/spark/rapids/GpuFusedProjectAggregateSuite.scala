@@ -22,7 +22,7 @@ import org.apache.spark.SparkConf
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Complete, Partial}
 import org.apache.spark.sql.rapids.aggregate.{GpuAggregateExpression, GpuCount}
-import org.apache.spark.sql.types.LongType
+import org.apache.spark.sql.types.{DecimalType, LongType}
 
 /**
  * Unit tests for GpuFusedProjectAggregate fusion detection logic.
@@ -128,6 +128,48 @@ class GpuFusedProjectAggregateSuite extends AnyFunSuite {
     assert(!completeMode.hasPartialMode)
     assert(!completeMode.hasFinalMode)
     assert(completeMode.hasCompleteMode)
+  }
+
+  // ==================== DECIMAL Type Support Tests ====================
+
+  test("DECIMAL64 (precision <= 18) should be supported by isSupportedDataType") {
+    // DECIMAL64 can be handled as int64 with scaled values
+    assert(GpuFusedProjectAggregate.isSupportedDataType(DecimalType(10, 2)),
+      "DECIMAL(10,2) should be supported")
+    assert(GpuFusedProjectAggregate.isSupportedDataType(DecimalType(18, 0)),
+      "DECIMAL(18,0) should be supported")
+    assert(GpuFusedProjectAggregate.isSupportedDataType(DecimalType(18, 6)),
+      "DECIMAL(18,6) should be supported")
+    assert(GpuFusedProjectAggregate.isSupportedDataType(DecimalType(1, 0)),
+      "DECIMAL(1,0) should be supported")
+  }
+
+  test("DECIMAL128 (precision > 18) should NOT be supported by isSupportedDataType") {
+    // DECIMAL128 requires 128-bit atomics which are not available
+    assert(!GpuFusedProjectAggregate.isSupportedDataType(DecimalType(19, 0)),
+      "DECIMAL(19,0) should NOT be supported")
+    assert(!GpuFusedProjectAggregate.isSupportedDataType(DecimalType(38, 10)),
+      "DECIMAL(38,10) should NOT be supported")
+    assert(!GpuFusedProjectAggregate.isSupportedDataType(DecimalType(20, 2)),
+      "DECIMAL(20,2) should NOT be supported")
+  }
+
+  test("shouldTryFusion accepts DECIMAL64 aggregate columns") {
+    val conf = createConf(enabled = true, minColumns = 1)
+    // Create aggregate with DECIMAL64 type
+    val decAttr = AttributeReference("dec_col", DecimalType(18, 2))()
+    val countAgg = GpuAggregateExpression(
+      GpuCount(Seq(decAttr)),
+      mode = Partial,
+      isDistinct = false,
+      filter = None,
+      resultId = ExprId(0)
+    )
+    val modeInfo = AggregateModeInfo(Seq(Partial), hasPartialMode = true,
+      hasPartialMergeMode = false, hasFinalMode = false, hasCompleteMode = false)
+
+    val result = GpuFusedProjectAggregate.shouldTryFusion(conf, Seq(countAgg), modeInfo)
+    assert(result, "Fusion should be enabled for DECIMAL64 columns")
   }
 }
 
