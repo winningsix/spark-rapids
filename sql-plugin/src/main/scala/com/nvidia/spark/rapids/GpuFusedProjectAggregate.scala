@@ -27,7 +27,7 @@ import com.nvidia.spark.rapids.jni.FusedTransformAggregate.ExpressionBuilder
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.rapids.{GpuGreaterThan, GpuMultiply}
+import org.apache.spark.sql.rapids.{GpuAdd, GpuGreaterThan, GpuMultiply, GpuSubtract}
 import org.apache.spark.sql.rapids.aggregate.{GpuAggregateExpression, GpuAverage,
   GpuBasicSum, GpuCount, GpuMax, GpuMin, GpuSum}
 import org.apache.spark.sql.types._
@@ -459,6 +459,247 @@ object CastCoalesceMulOtherMatcher extends ExpressionMatcher {
   }
 }
 
+// =============================================================================
+// TPC-H Pattern Matchers (Phase 1a)
+// =============================================================================
+
+/**
+ * Simple multiply matcher - handles col1 * col2 pattern
+ * TPC-H Q6: SUM(l_extendedprice * l_discount)
+ */
+object MulMatcher extends ExpressionMatcher {
+  override def name: String = "Mul (a * b)"
+  override def priority: Int = 55  // After CoalesceMul patterns
+  
+  override def tryMatch(expr: Expression, ctx: FusionContext): Boolean = {
+    expr match {
+      case GpuMultiply(left, right, _) =>
+        // Both sides must be simple column references
+        (resolveColumnIndex(left, ctx.colIndexMap), 
+         resolveColumnIndex(right, ctx.colIndexMap)) match {
+          case (Some(leftIdx), Some(rightIdx)) =>
+            ctx.builder.addMul(leftIdx, rightIdx, ctx.aggOp)
+            true
+          case _ => false
+        }
+      case _ => false
+    }
+  }
+  
+  private def resolveColumnIndex(
+      expr: Expression, 
+      colIndexMap: Map[ExprId, Int]): Option[Int] = {
+    expr match {
+      case ref: AttributeReference => colIndexMap.get(ref.exprId)
+      case ref: GpuBoundReference => Some(ref.ordinal)
+      case GpuCast(inner, _, _, _, _, _) => resolveColumnIndex(inner, colIndexMap)
+      case _ => None
+    }
+  }
+}
+
+/**
+ * Multiply with subtraction from constant matcher
+ * TPC-H Q1: SUM(l_extendedprice * (1 - l_discount))
+ * 
+ * Pattern: col1 * (const - col2)
+ */
+object MulSubConstMatcher extends ExpressionMatcher {
+  override def name: String = "MulSubConst (a * (const - b))"
+  override def priority: Int = 52  // Before simple Mul
+  
+  override def tryMatch(expr: Expression, ctx: FusionContext): Boolean = {
+    expr match {
+      // Pattern: col1 * (const - col2)
+      case GpuMultiply(left, GpuSubtract(constExpr, right, _), _) =>
+        (resolveColumnIndex(left, ctx.colIndexMap),
+         resolveColumnIndex(right, ctx.colIndexMap),
+         extractConstant(constExpr, ctx)) match {
+          case (Some(leftIdx), Some(rightIdx), Some(constVal)) =>
+            ctx.builder.addMulSubConst(leftIdx, rightIdx, constVal, ctx.aggOp)
+            true
+          case _ => false
+        }
+      case _ => false
+    }
+  }
+  
+  private def resolveColumnIndex(
+      expr: Expression, 
+      colIndexMap: Map[ExprId, Int]): Option[Int] = {
+    expr match {
+      case ref: AttributeReference => colIndexMap.get(ref.exprId)
+      case ref: GpuBoundReference => Some(ref.ordinal)
+      case GpuCast(inner, _, _, _, _, _) => resolveColumnIndex(inner, colIndexMap)
+      case _ => None
+    }
+  }
+  
+  private def extractConstant(expr: Expression, ctx: FusionContext): Option[Long] = {
+    expr match {
+      case GpuLiteral(value, _) => ctx.toLong(value)
+      case Literal(value, _) => ctx.toLong(value)
+      case GpuCast(inner, _, _, _, _, _) => extractConstant(inner, ctx)
+      case _ => None
+    }
+  }
+}
+
+/**
+ * TPC-H Q1 sum_charge pattern matcher
+ * TPC-H Q1: SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax))
+ * 
+ * Pattern: col1 * (const1 - col2) * (const2 + col3)
+ * Also handles: col1 * (const1 - col2) * (col3 + const2)  (commutative Add)
+ */
+object MulSubConstMulAddConstMatcher extends ExpressionMatcher {
+  override def name: String = "MulSubConstMulAddConst (a * (c1 - b) * (c2 + c))"
+  override def priority: Int = 50  // Before CaseMul and MulSubConst
+  
+  override def tryMatch(expr: Expression, ctx: FusionContext): Boolean = {
+    expr match {
+      // Pattern: (col1 * (const1 - col2)) * (const2 + col3) or (col3 + const2)
+      case GpuMultiply(
+          GpuMultiply(left, GpuSubtract(const1Expr, right1, _), _),
+          GpuAdd(addLeft, addRight, _), _) =>
+        // Determine which operand of Add is the constant and which is the column
+        val (const2Opt, right2Opt) = (isConstantExpr(addLeft), isConstantExpr(addRight)) match {
+          case (true, false) => (extractConstant(addLeft, ctx), resolveColumnIndex(addRight, ctx.colIndexMap))
+          case (false, true) => (extractConstant(addRight, ctx), resolveColumnIndex(addLeft, ctx.colIndexMap))
+          case _ => (None, None)  // Both constants or both columns - not a valid pattern
+        }
+        
+        (resolveColumnIndex(left, ctx.colIndexMap),
+         resolveColumnIndex(right1, ctx.colIndexMap),
+         right2Opt,
+         extractConstant(const1Expr, ctx),
+         const2Opt) match {
+          case (Some(valIdx), Some(otherIdx), Some(thirdIdx), Some(const1), Some(const2)) =>
+            ctx.builder.addMulSubConstMulAddConst(valIdx, otherIdx, thirdIdx, const1, const2, ctx.aggOp)
+            true
+          case _ => false
+        }
+        
+      case _ => false
+    }
+  }
+  
+  private def resolveColumnIndex(
+      expr: Expression, 
+      colIndexMap: Map[ExprId, Int]): Option[Int] = {
+    expr match {
+      case ref: AttributeReference => colIndexMap.get(ref.exprId)
+      case ref: GpuBoundReference => Some(ref.ordinal)
+      case GpuCast(inner, _, _, _, _, _) => resolveColumnIndex(inner, colIndexMap)
+      case _ => None
+    }
+  }
+  
+  private def extractConstant(expr: Expression, ctx: FusionContext): Option[Long] = {
+    expr match {
+      case GpuLiteral(value, _) => ctx.toLong(value)
+      case Literal(value, _) => ctx.toLong(value)
+      case GpuCast(inner, _, _, _, _, _) => extractConstant(inner, ctx)
+      case _ => None
+    }
+  }
+  
+  private def isConstantExpr(expr: Expression): Boolean = expr match {
+    case _: GpuLiteral => true
+    case _: Literal => true
+    case GpuCast(inner, _, _, _, _, _) => isConstantExpr(inner)
+    case _ => false
+  }
+}
+
+/**
+ * Case-when multiply matcher
+ * TPC-H Q14: SUM(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1-l_discount) ELSE 0)
+ * 
+ * Pattern: CASE WHEN cond THEN col1 * col2 ELSE 0
+ * 
+ * Note: For LIKE patterns, we expect a pre-computed boolean column (1 for match, 0 for no match).
+ * The condition becomes: condCol > 0
+ */
+object CaseMulMatcher extends ExpressionMatcher {
+  override def name: String = "CaseMul (CASE WHEN c THEN a*b ELSE 0)"
+  override def priority: Int = 51  // Before MulSubConst
+  
+  override def tryMatch(expr: Expression, ctx: FusionContext): Boolean = {
+    expr match {
+      // Pattern: CaseWhen with single branch and else
+      case cw: GpuCaseWhen if cw.branches.size == 1 =>
+        val (condExpr, thenExpr) = cw.branches.head
+        val elseExpr = cw.elseValue
+        
+        // Try to match: CASE WHEN cond THEN a*b ELSE 0
+        (resolveCondition(condExpr, ctx),
+         resolveMulExpr(thenExpr, ctx.colIndexMap),
+         extractElseValue(elseExpr, ctx)) match {
+          case (Some((condIdx, threshold)), Some((valIdx, otherIdx)), Some(elseVal)) =>
+            ctx.builder.addCaseMul(valIdx, otherIdx, condIdx, threshold, elseVal, ctx.aggOp)
+            true
+          case _ => false
+        }
+      case _ => false
+    }
+  }
+  
+  // Returns (condColIdx, threshold) - condition is: condCol > threshold
+  private def resolveCondition(
+      expr: Expression,
+      ctx: FusionContext): Option[(Int, Long)] = {
+    expr match {
+      // Pattern: col > literal
+      case GpuGreaterThan(left, GpuLiteral(value, _)) =>
+        resolveColumnIndex(left, ctx.colIndexMap).flatMap { idx =>
+          ctx.toLong(value).map(v => (idx, v))
+        }
+      // Boolean column (for pre-computed LIKE result): treat as col > 0
+      case ref: AttributeReference if ref.dataType == BooleanType =>
+        ctx.colIndexMap.get(ref.exprId).map(idx => (idx, 0L))
+      case ref: GpuBoundReference if ref.dataType == BooleanType =>
+        Some((ref.ordinal, 0L))
+      case _ => None
+    }
+  }
+  
+  // Returns (valColIdx, otherColIdx) for multiply expression
+  private def resolveMulExpr(
+      expr: Expression,
+      colIndexMap: Map[ExprId, Int]): Option[(Int, Int)] = {
+    expr match {
+      case GpuMultiply(left, right, _) =>
+        (resolveColumnIndex(left, colIndexMap),
+         resolveColumnIndex(right, colIndexMap)) match {
+          case (Some(l), Some(r)) => Some((l, r))
+          case _ => None
+        }
+      case _ => None
+    }
+  }
+  
+  private def resolveColumnIndex(
+      expr: Expression,
+      colIndexMap: Map[ExprId, Int]): Option[Int] = {
+    expr match {
+      case ref: AttributeReference => colIndexMap.get(ref.exprId)
+      case ref: GpuBoundReference => Some(ref.ordinal)
+      case GpuCast(inner, _, _, _, _, _) => resolveColumnIndex(inner, colIndexMap)
+      case _ => None
+    }
+  }
+  
+  private def extractElseValue(elseOpt: Option[Expression], ctx: FusionContext): Option[Long] = {
+    elseOpt match {
+      case Some(GpuLiteral(value, _)) => ctx.toLong(value)
+      case Some(Literal(value, _)) => ctx.toLong(value)
+      case None => Some(0L)  // No else means NULL, treat as 0 for SUM
+      case _ => None
+    }
+  }
+}
+
 // Register all built-in matchers
 object BuiltinMatchersInit {
   def init(): Unit = {
@@ -472,6 +713,11 @@ object BuiltinMatchersInit {
     ExpressionMatcherRegistry.register(ConditionalMatcher)
     ExpressionMatcherRegistry.register(ConditionalCoalesceMatcher)
     ExpressionMatcherRegistry.register(CastWrapperMatcher)
+    // TPC-H patterns (Phase 1a)
+    ExpressionMatcherRegistry.register(MulSubConstMulAddConstMatcher)  // Most complex first
+    ExpressionMatcherRegistry.register(CaseMulMatcher)
+    ExpressionMatcherRegistry.register(MulSubConstMatcher)
+    ExpressionMatcherRegistry.register(MulMatcher)
   }
 }
 
@@ -660,7 +906,9 @@ object GpuFusedProjectAggregate extends Logging {
             exprId -> isFusableExpression(childExpr)
           }.toMap
           
-          // Check that all aggregate inputs reference fusable project expressions
+          // Check that all aggregate inputs reference fusable project expressions OR are directly fusable inline expressions
+          // 1. AttributeReference → check the project expression it references
+          // 2. Inline expression → check if it matches a fusable pattern directly
           val unfusableAggInputs = aggExprs.flatMap { aggExpr =>
             aggExpr.aggregateFunction.children.headOption.flatMap {
               case ref: AttributeReference =>
@@ -669,7 +917,17 @@ object GpuFusedProjectAggregate extends Logging {
                   case None => None // Not in project, might be direct column reference
                   case Some(true) => None
                 }
-              case _ => None
+              case _: GpuLiteral | _: Literal =>
+                // COUNT(1) has a literal child - this is fusable as IDENTITY transform
+                logWarning(s"[FUSION-CHECK] Literal child - fusable (COUNT(1) pattern)")
+                None
+              case other if isFusableExpression(other) => 
+                // Inline expression is directly fusable (e.g., SUM(a*b) with fusable a*b)
+                logWarning(s"[FUSION-CHECK] Inline expression is fusable: ${other.getClass.getSimpleName}")
+                None
+              case other => 
+                // Non-fusable inline expression
+                Some(s"inline:${other.getClass.getSimpleName}")
             }
           }.distinct
           
@@ -875,9 +1133,50 @@ object GpuFusedProjectAggregate extends Logging {
           GpuCoalesce(Seq(GpuCaseWhen(_, _, _), lit1: GpuLiteral)),
           GpuCoalesce(Seq(GpuCaseWhen(_, _, _), lit2: GpuLiteral)), _) => 
         isLiteralConvertibleToLong(lit1) && isLiteralConvertibleToLong(lit2)
+      
+      // === TPC-H patterns (Phase 1a) ===
+      
+      // Simple multiply: col * col (TPC-H Q6: l_extendedprice * l_discount)
+      case GpuMultiply(left, right, _) 
+          if isSimpleColumnRef(left) && isSimpleColumnRef(right) => true
+      
+      // Multiply with subtraction: col * (const - col) (TPC-H Q1: l_extendedprice * (1 - l_discount))
+      case GpuMultiply(left, GpuSubtract(constExpr, right, _), _)
+          if isSimpleColumnRef(left) && isSimpleColumnRef(right) && isConstantExpr(constExpr) => true
+      
+      // TPC-H Q1 sum_charge: col * (const - col) * (const + col)
+      // Pattern 1: (l_extendedprice * (1 - l_discount)) * (1 + l_tax)
+      case GpuMultiply(
+          GpuMultiply(left, GpuSubtract(c1, right1, _), _),
+          GpuAdd(c2, right2, _), _)
+          if isSimpleColumnRef(left) && isSimpleColumnRef(right1) && 
+             isSimpleColumnRef(right2) && isConstantExpr(c1) && isConstantExpr(c2) => true
+      
+      // Pattern 2: (l_extendedprice * (1 - l_discount)) * (l_tax + 1) - swapped Add
+      case GpuMultiply(
+          GpuMultiply(left, GpuSubtract(c1, right1, _), _),
+          GpuAdd(right2, c2, _), _)
+          if isSimpleColumnRef(left) && isSimpleColumnRef(right1) && 
+             isSimpleColumnRef(right2) && isConstantExpr(c1) && isConstantExpr(c2) => true
           
       case _ => false
     }
+  }
+  
+  /** Check if expression is a simple column reference (AttributeReference or GpuBoundReference) */
+  private def isSimpleColumnRef(expr: Expression): Boolean = expr match {
+    case _: AttributeReference => true
+    case _: GpuBoundReference => true
+    case GpuCast(inner, _, _, _, _, _) => isSimpleColumnRef(inner)
+    case _ => false
+  }
+  
+  /** Check if expression is a constant (literal) */
+  private def isConstantExpr(expr: Expression): Boolean = expr match {
+    case _: GpuLiteral => true
+    case _: Literal => true
+    case GpuCast(inner, _, _, _, _, _) => isConstantExpr(inner)
+    case _ => false
   }
 
   /**
@@ -1016,10 +1315,8 @@ object GpuFusedProjectAggregate extends Logging {
         // Get group-by column indices
         val groupByIndices = extractGroupByIndices(groupingExprs, projectExprs, colIndexMap)
         
-        if (groupByIndices.isEmpty) {
-          logDebug("No valid group-by columns found, falling back")
-          return None
-        }
+        // Note: groupByIndices can be empty for scalar aggregation (no GROUP BY)
+        // The JNI layer now supports this case
         
         logWarning(s"[FUSION] All ${aggExprs.size} aggregates fusable, executing fused kernel")
         
@@ -1076,8 +1373,14 @@ object GpuFusedProjectAggregate extends Logging {
             val countOk = analyzeAndAddExpression(
               builder, ref, projectExprs, colIndexMap, AGG_COUNT)
             return countOk
-          case _ =>
-            return false
+          case inlineExpr =>
+            // Inline expression in AVG (e.g., AVG(a*b))
+            // First add SUM expression
+            val sumOk = analyzeProjectChild(builder, inlineExpr, colIndexMap, AGG_SUM)
+            if (!sumOk) return false
+            // Then add COUNT expression
+            val countOk = analyzeProjectChild(builder, inlineExpr, colIndexMap, AGG_COUNT)
+            return countOk
         }
       case _ => // Fall through to normal handling
     }
@@ -1123,8 +1426,11 @@ object GpuFusedProjectAggregate extends Logging {
           return true
         }
         false
-      case _ =>
-        false
+      case inlineExpr =>
+        // Inline expression in aggregate (e.g., SUM(a*b) instead of SUM(alias))
+        // Try to analyze it directly using expression matchers
+        logWarning(s"[FUSION] Trying to analyze inline expression: ${inlineExpr.getClass.getSimpleName}")
+        analyzeProjectChild(builder, inlineExpr, colIndexMap, aggOp)
     }
   }
 
@@ -1337,9 +1643,28 @@ object GpuFusedProjectAggregate extends Logging {
             new ColumnarBatch(Array.empty, 0),
             SpillPriorities.ACTIVE_BATCHING_PRIORITY)
         } else {
-          val numRows = keysTable.getRowCount.toInt
+          val keysRows = keysTable.getRowCount
+          val valuesRows = valuesTable.getRowCount
           val numKeyCols = keysTable.getNumberOfColumns
           val numValCols = valuesTable.getNumberOfColumns
+          
+          // DEBUG: Check row count consistency
+          logWarning(s"[FUSION-DEBUG] keysRows=$keysRows, valuesRows=$valuesRows, " +
+            s"keyCols=$numKeyCols, valCols=$numValCols")
+          
+          // For grouped aggregation, keys and values should have the same row count
+          // For scalar aggregation, keys has 0 rows and values has 1 row
+          val numRows = if (numKeyCols == 0) {
+            // Scalar aggregation: use values row count
+            valuesRows.toInt
+          } else if (keysRows != valuesRows) {
+            // ERROR: Row count mismatch - this should not happen
+            throw new IllegalStateException(
+              s"[FUSION BUG] Row count mismatch: keysRows=$keysRows, valuesRows=$valuesRows. " +
+              "This indicates a bug in fused kernel output.")
+          } else {
+            keysRows.toInt
+          }
           
           // FIX: Use copyToColumnVector() to create TRUE DEEP COPIES
           // This ensures columns have completely independent memory that won't be
@@ -1357,6 +1682,11 @@ object GpuFusedProjectAggregate extends Logging {
             case ai.rapids.cudf.DType.INT16 => ShortType
             case ai.rapids.cudf.DType.INT8 => ByteType
             case ai.rapids.cudf.DType.BOOL8 => BooleanType
+            case ai.rapids.cudf.DType.STRING => StringType
+            case dt if dt.isTimestampType => TimestampType
+            case dt if dt.hasTimeResolution => 
+              // Handle DATE types
+              DateType
             case dt if dt.isDecimalType =>
               // DECIMAL64 or DECIMAL128 - get precision and scale
               // Scale in cuDF can be negative for large numbers
