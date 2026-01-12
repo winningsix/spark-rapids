@@ -140,6 +140,12 @@ object GpuMetric extends Logging {
   val SYNC_READ_TIME = "shuffleSyncReadTime"
   val ASYNC_READ_TIME = "shuffleAsyncReadTime"
 
+  // Hybrid Scan metrics
+  val HYBRID_FILTER_COL_TIME = "hybridFilterColTime"
+  val HYBRID_PAYLOAD_COL_TIME = "hybridPayloadColTime"
+  val HYBRID_ROW_MASK_TIME = "hybridRowMaskTime"
+  val HYBRID_STATS_FILTER_TIME = "hybridStatsFilterTime"
+
   // Metric Descriptions.
   val DESCRIPTION_BUFFER_TIME = "buffer time"
   val DESCRIPTION_BUFFER_TIME_BUBBLE = "buffer time (GPU underloaded)"
@@ -193,6 +199,12 @@ object GpuMetric extends Logging {
   val DESCRIPTION_BIG_JOIN_COUNT = "big joins"
   val DESCRIPTION_SYNC_READ_TIME = "sync read time"
   val DESCRIPTION_ASYNC_READ_TIME = "async read time"
+
+  // Hybrid Scan metric descriptions
+  val DESCRIPTION_HYBRID_FILTER_COL_TIME = "hybrid scan filter column read time"
+  val DESCRIPTION_HYBRID_PAYLOAD_COL_TIME = "hybrid scan payload column read time"
+  val DESCRIPTION_HYBRID_ROW_MASK_TIME = "hybrid scan row mask build time"
+  val DESCRIPTION_HYBRID_STATS_FILTER_TIME = "hybrid scan stats filter time"
 
   /**
    * Determine if a GpuMetric wraps a TimingMetric or NanoTimingMetric.

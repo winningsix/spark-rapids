@@ -337,9 +337,14 @@ class CudfHybridScanPartitionReader(
 
   // Metrics
   private val readTime = metrics.getOrElse(GpuMetric.READ_FS_TIME, NoopMetric)
-  private val filterTime = metrics.getOrElse("hybridFilterTime", NoopMetric)
+  private val filterTime = metrics.getOrElse(GpuMetric.FILTER_TIME, NoopMetric)
   private val numOutputRows = metrics.getOrElse(GpuMetric.NUM_OUTPUT_ROWS, NoopMetric)
   private val numOutputBatches = metrics.getOrElse(GpuMetric.NUM_OUTPUT_BATCHES, NoopMetric)
+  // Hybrid Scan specific metrics
+  private val filterColTime = metrics.getOrElse(GpuMetric.HYBRID_FILTER_COL_TIME, NoopMetric)
+  private val payloadColTime = metrics.getOrElse(GpuMetric.HYBRID_PAYLOAD_COL_TIME, NoopMetric)
+  private val rowMaskTime = metrics.getOrElse(GpuMetric.HYBRID_ROW_MASK_TIME, NoopMetric)
+  private val statsFilterTime = metrics.getOrElse(GpuMetric.HYBRID_STATS_FILTER_TIME, NoopMetric)
 
   // Parallel IO configuration (now passed as constructor parameters)
 
@@ -483,7 +488,7 @@ class CudfHybridScanPartitionReader(
         // Note: filterRowGroupsWithStats requires a filter expression.
         // Skip this step if no filter expression is available.
         try {
-          rowGroupIndices = filterTime.ns {
+          rowGroupIndices = statsFilterTime.ns {
             hybridScanReader.filterRowGroupsWithStats(rowGroupIndices)
           }
           if (rowGroupIndices.isEmpty) {
@@ -526,7 +531,7 @@ class CudfHybridScanPartitionReader(
         // Skip page index filtering if no filter expression is available.
         val rowMask = if (usePageIndex) {
           try {
-            filterTime.ns {
+            rowMaskTime.ns {
               hybridScanReader.buildRowMaskWithPageIndex(rowGroupIndices)
             }
           } catch {
@@ -752,15 +757,17 @@ class CudfHybridScanPartitionReader(
         logDebug("No filter buffers available, reading all columns as payload columns")
         // Pass host buffer addresses - JNI will copy to device
         val (payloadAddrs, payloadSizes) = getHostBufferAddrsAndSizes(allPayloadBuffers)
-          val payloadTable = hybridScanReader.materializePayloadColumns(
-            rowGroupIndices, payloadAddrs, payloadSizes,
-            rowMask.getNativeView, usePageIndex)
+          val payloadTable = payloadColTime.ns {
+            hybridScanReader.materializePayloadColumns(
+              rowGroupIndices, payloadAddrs, payloadSizes,
+              rowMask.getNativeView, usePageIndex)
+          }
           payloadTable
       } else {
         // Normal path: read filter and payload columns separately
         // Pass host buffer addresses - JNI will copy to device (cuDF manages GPU memory)
         val (filterAddrs, filterSizes) = getHostBufferAddrsAndSizes(allFilterBuffers)
-          val filterTable = filterTime.ns {
+          val filterTable = filterColTime.ns {
             hybridScanReader.materializeFilterColumns(
               rowGroupIndices, filterAddrs, filterSizes,
               rowMask.getNativeView, usePageIndex)
@@ -769,9 +776,11 @@ class CudfHybridScanPartitionReader(
           try {
           // Materialize payload columns - pass host addresses
           val (payloadAddrs, payloadSizes) = getHostBufferAddrsAndSizes(allPayloadBuffers)
-            val payloadTable = hybridScanReader.materializePayloadColumns(
-              rowGroupIndices, payloadAddrs, payloadSizes,
-              rowMask.getNativeView, usePageIndex)
+            val payloadTable = payloadColTime.ns {
+              hybridScanReader.materializePayloadColumns(
+                rowGroupIndices, payloadAddrs, payloadSizes,
+                rowMask.getNativeView, usePageIndex)
+            }
 
           // Combine tables - this will close filterTable and payloadTable
             combineFilterAndPayloadTables(filterTable, payloadTable)
@@ -822,7 +831,7 @@ class CudfHybridScanPartitionReader(
 
         // Filter row groups with statistics. Skip if no filter expression.
         try {
-          rowGroupIndices = filterTime.ns {
+          rowGroupIndices = statsFilterTime.ns {
             hybridScanReader.filterRowGroupsWithStats(rowGroupIndices)
           }
           if (rowGroupIndices.isEmpty) {
@@ -862,7 +871,7 @@ class CudfHybridScanPartitionReader(
         // Skip page index filtering if no filter expression.
         val rowMask = if (usePageIndex) {
           try {
-            filterTime.ns {
+            rowMaskTime.ns {
               hybridScanReader.buildRowMaskWithPageIndex(rowGroupIndices)
             }
           } catch {
@@ -931,9 +940,11 @@ class CudfHybridScanPartitionReader(
               }
               try {
                 val (payloadAddrs, payloadSizes) = getHostBufferAddrsAndSizes(payloadHostBuffers)
-              val payloadTable = hybridScanReader.materializePayloadColumns(
-                fallbackRowGroupIndices, payloadAddrs, payloadSizes,
-                rowMask.getNativeView, usePageIndex)
+              val payloadTable = payloadColTime.ns {
+                hybridScanReader.materializePayloadColumns(
+                  fallbackRowGroupIndices, payloadAddrs, payloadSizes,
+                  rowMask.getNativeView, usePageIndex)
+              }
                 // Must close table after creating batch
                 return withResource(payloadTable) { table =>
                   GpuColumnVector.from(table, readSchema.fields.map(_.dataType).toArray)
@@ -954,7 +965,7 @@ class CudfHybridScanPartitionReader(
 
           try {
             val (filterAddrs, filterSizes) = getHostBufferAddrsAndSizes(filterHostBuffers)
-          val filterTable = filterTime.ns {
+          val filterTable = filterColTime.ns {
             hybridScanReader.materializeFilterColumns(
               rowGroupIndices, filterAddrs, filterSizes,
               rowMask.getNativeView, usePageIndex)
@@ -981,9 +992,11 @@ class CudfHybridScanPartitionReader(
 
               try {
                 val (payloadAddrs, payloadSizes) = getHostBufferAddrsAndSizes(payloadHostBuffers)
-          val payloadTable = hybridScanReader.materializePayloadColumns(
-            rowGroupIndices, payloadAddrs, payloadSizes,
-            rowMask.getNativeView, usePageIndex)
+          val payloadTable = payloadColTime.ns {
+            hybridScanReader.materializePayloadColumns(
+              rowGroupIndices, payloadAddrs, payloadSizes,
+              rowMask.getNativeView, usePageIndex)
+          }
 
                 // combineFilterAndPayloadTables will close both tables
           logInfo(s"[HYBRID] filter: ${filterTable.getRowCount} rows, " +
