@@ -3327,6 +3327,8 @@ case class GpuParquetHybridScanPartitionReaderFactory(
   private val parallelIOEnabled = rapidsConf.cudfHybridScanParallelIOEnabled
   private val numIOThreads = rapidsConf.cudfHybridScanParallelIONumThreads
   private val maxRowGroupsParallel = rapidsConf.cudfHybridScanMaxRowGroupsParallel
+  private val selectivityThreshold = rapidsConf.cudfHybridScanSelectivityThreshold
+  private val pipeliningEnabled = rapidsConf.cudfHybridScanPipeliningEnabled
 
   override def buildReader(partitionedFile: PartitionedFile): PartitionReader[InternalRow] = {
     throw new IllegalStateException("GPU column parser called to read rows")
@@ -3335,9 +3337,8 @@ case class GpuParquetHybridScanPartitionReaderFactory(
   override def buildColumnarReader(
       partitionedFile: PartitionedFile): PartitionReader[ColumnarBatch] = {
     
-    val conf = broadcastedConf.value.value
+    val hadoopConf = broadcastedConf.value.value
     val filePath = new Path(new URI(partitionedFile.filePath.toString()))
-    
 
     logInfo(s"Creating cuDF Hybrid Scan reader for ${filePath}")
     logDebug(s"Filter columns: [${filterColumns.mkString(", ")}]")
@@ -3346,7 +3347,7 @@ case class GpuParquetHybridScanPartitionReaderFactory(
     // Create the hybrid scan partition reader with extracted config values
     // Now passing dataFilters to enable filter expression conversion
     new CudfHybridScanPartitionReader(
-      conf,
+      hadoopConf,
       partitionedFile,
       filePath,
       readDataSchema,
@@ -3357,6 +3358,8 @@ case class GpuParquetHybridScanPartitionReaderFactory(
       parallelIOEnabled,
       numIOThreads,
       maxRowGroupsParallel,
+      selectivityThreshold,
+      pipeliningEnabled,
       metrics,
       dataFilters  // Pass dataFilters for filter expression conversion
     )

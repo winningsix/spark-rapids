@@ -2083,6 +2083,16 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .checkValue(v => v >= 0, "Prefetch buffer size must be non-negative")
     .createWithDefault(8 * 1024 * 1024) // 8MB default
 
+  val CUDF_HYBRID_SCAN_PIPELINING_ENABLED = 
+    conf("spark.rapids.sql.parquet.cudfHybridScan.pipelining.enabled")
+    .doc("Enable intra-file pipelining for cuDF Hybrid Scan. " +
+      "When enabled, filter column reading and payload column reading are overlapped " +
+      "with GPU processing to improve throughput. This requires additional memory for " +
+      "buffering but can significantly reduce total read time for large files.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
   val HASH_AGG_REPLACE_MODE = conf("spark.rapids.sql.hashAgg.replaceMode")
     .doc("Only when hash aggregate exec has these modes (\"all\" by default): " +
       "\"all\" (try to replace all aggregates, default), " +
@@ -3442,6 +3452,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val cudfHybridScanMaxRowGroupsParallel: Int = get(CUDF_HYBRID_SCAN_MAX_ROW_GROUPS_PARALLEL)
 
   lazy val cudfHybridScanPrefetchBufferSize: Long = get(CUDF_HYBRID_SCAN_PREFETCH_BUFFER_SIZE)
+
+  lazy val cudfHybridScanPipeliningEnabled: Boolean = get(CUDF_HYBRID_SCAN_PIPELINING_ENABLED)
 
   lazy val hashAggReplaceMode: String = get(HASH_AGG_REPLACE_MODE)
 

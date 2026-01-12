@@ -32,7 +32,8 @@ import org.apache.hadoop.fs.{FileSystem, FSDataInputStream, Path}
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.catalyst.expressions.{And, AttributeReference,
+  EqualTo, Expression, GreaterThan, GreaterThanOrEqual, In, LessThan, LessThanOrEqual, Literal}
 import org.apache.spark.sql.connector.read.PartitionReader
 import org.apache.spark.sql.execution.datasources.PartitionedFile
 import org.apache.spark.sql.types.StructType
@@ -125,6 +126,299 @@ object CudfHybridScanUtils extends Logging {
     // Preserve readSchema order for payload columns (non-filter columns)
     val payloadColumns = readSchema.fieldNames.filterNot(filterColumnSet.contains)
     (filterColumns, payloadColumns)
+  }
+
+  /**
+   * Estimate filter selectivity based on row group statistics (min/max values).
+   * This helps decide if Hybrid Scan is worthwhile for this query.
+   * 
+   * Selectivity estimation logic:
+   * - For equality filters (col = value): estimate based on value range
+   * - For range filters (col > value): estimate based on overlap with value range
+   * - For compound filters (AND): multiply individual selectivities
+   * 
+   * @param filters The filter expressions
+   * @param rowGroupStats Map of column name to (min, max) statistics
+   * @param totalRows Total rows in all row groups
+   * @return Estimated selectivity between 0.0 and 1.0
+   */
+  def estimateSelectivity(
+      filters: Seq[Expression],
+      rowGroupStats: Map[String, (Any, Any)],
+      totalRows: Long): Double = {
+    
+    if (filters.isEmpty || totalRows == 0) {
+      return 1.0 // No filtering, all rows selected
+    }
+
+    // Calculate selectivity for each filter and combine with AND semantics
+    val filterSelectivities = filters.map(estimateSingleFilterSelectivity(_, rowGroupStats))
+    
+    // Combine selectivities - for AND, multiply them
+    // Cap at minimum of 0.001 to avoid underestimation
+    val combined = filterSelectivities.product
+    math.max(0.001, math.min(1.0, combined))
+  }
+
+  /**
+   * Estimate selectivity for a single filter expression.
+   */
+  private def estimateSingleFilterSelectivity(
+      filter: Expression,
+      stats: Map[String, (Any, Any)]): Double = {
+    
+    filter match {
+      // Equality filter: col = literal
+      case EqualTo(attr: AttributeReference, lit: Literal) =>
+        estimateEqualitySelectivity(attr.name, lit.value, stats)
+      case EqualTo(lit: Literal, attr: AttributeReference) =>
+        estimateEqualitySelectivity(attr.name, lit.value, stats)
+        
+      // Range filters
+      case GreaterThan(attr: AttributeReference, lit: Literal) =>
+        estimateRangeSelectivity(attr.name, lit.value, stats, isGreater = true, inclusive = false)
+      case GreaterThanOrEqual(attr: AttributeReference, lit: Literal) =>
+        estimateRangeSelectivity(attr.name, lit.value, stats, isGreater = true, inclusive = true)
+      case LessThan(attr: AttributeReference, lit: Literal) =>
+        estimateRangeSelectivity(attr.name, lit.value, stats, isGreater = false, inclusive = false)
+      case LessThanOrEqual(attr: AttributeReference, lit: Literal) =>
+        estimateRangeSelectivity(attr.name, lit.value, stats, isGreater = false, inclusive = true)
+        
+      // IN filter: col IN (v1, v2, ...)
+      case In(attr: AttributeReference, list) =>
+        // Each value in list contributes equality selectivity
+        val numValues = list.size
+        math.min(1.0, numValues * estimateEqualitySelectivity(attr.name, null, stats))
+        
+      // AND filter: combine sub-filter selectivities
+      case And(left, right) =>
+        val leftSel = estimateSingleFilterSelectivity(left, stats)
+        val rightSel = estimateSingleFilterSelectivity(right, stats)
+        leftSel * rightSel
+        
+      // Unknown filter type - assume moderate selectivity
+      case _ =>
+        logDebug(s"Unknown filter type for selectivity estimation: ${filter.getClass.getName}")
+        0.5
+    }
+  }
+
+  /**
+   * Estimate selectivity for equality filter based on column value range.
+   * If value is within range, estimate as 1/distinct_values.
+   * If value is outside range, selectivity is 0.
+   */
+  private def estimateEqualitySelectivity(
+      colName: String,
+      value: Any,
+      stats: Map[String, (Any, Any)]): Double = {
+    
+    stats.get(colName) match {
+      case Some((minVal, maxVal)) =>
+        // Estimate distinct values from range
+        val distinctEstimate = estimateDistinctValues(minVal, maxVal)
+        if (distinctEstimate > 0) {
+          1.0 / distinctEstimate
+        } else {
+          0.1 // Default for unknown range
+        }
+      case None =>
+        0.1 // No stats available, assume 10% selectivity
+    }
+  }
+
+  /**
+   * Estimate selectivity for range filter based on overlap with column value range.
+   */
+  private def estimateRangeSelectivity(
+      colName: String,
+      value: Any,
+      stats: Map[String, (Any, Any)],
+      isGreater: Boolean,
+      inclusive: Boolean): Double = {
+    
+    stats.get(colName) match {
+      case Some((minVal, maxVal)) =>
+        // Calculate overlap ratio
+        val overlap = calculateRangeOverlap(minVal, maxVal, value, isGreater)
+        math.max(0.01, math.min(1.0, overlap))
+      case None =>
+        0.5 // No stats, assume 50% selectivity for range
+    }
+  }
+
+  /**
+   * Estimate number of distinct values from min/max range.
+   */
+  private def estimateDistinctValues(min: Any, max: Any): Long = {
+    (min, max) match {
+      case (minL: java.lang.Long, maxL: java.lang.Long) =>
+        math.abs(maxL - minL) + 1
+      case (minI: java.lang.Integer, maxI: java.lang.Integer) =>
+        math.abs(maxI.toLong - minI.toLong) + 1
+      case (minD: java.lang.Double, maxD: java.lang.Double) =>
+        // For doubles, estimate based on range magnitude
+        math.max(1, (maxD - minD).toLong)
+      case (_: String, _: String) =>
+        // For strings, use a heuristic
+        1000 // Assume moderate cardinality
+      case _ =>
+        100 // Default estimate
+    }
+  }
+
+  /**
+   * Calculate what fraction of the range [min, max] satisfies the filter.
+   */
+  private def calculateRangeOverlap(min: Any, max: Any, value: Any, isGreater: Boolean): Double = {
+    try {
+      val (minD, maxD, valD) = (min, max, value) match {
+        case (minL: java.lang.Long, maxL: java.lang.Long, v: java.lang.Long) =>
+          (minL.toDouble, maxL.toDouble, v.toDouble)
+        case (minI: java.lang.Integer, maxI: java.lang.Integer, v: java.lang.Integer) =>
+          (minI.toDouble, maxI.toDouble, v.toDouble)
+        case (minD: java.lang.Double, maxD: java.lang.Double, v: java.lang.Double) =>
+          (minD.doubleValue, maxD.doubleValue, v.doubleValue)
+        case _ =>
+          return 0.5 // Cannot compute, assume 50%
+      }
+      
+      val range = maxD - minD
+      if (range <= 0) return 0.5
+      
+      if (isGreater) {
+        // col > value: fraction of range above value
+        if (valD >= maxD) 0.0
+        else if (valD <= minD) 1.0
+        else (maxD - valD) / range
+      } else {
+        // col < value: fraction of range below value
+        if (valD <= minD) 0.0
+        else if (valD >= maxD) 1.0
+        else (valD - minD) / range
+      }
+    } catch {
+      case _: Exception => 0.5
+    }
+  }
+
+  /**
+   * Check if Hybrid Scan is likely beneficial based on selectivity estimation.
+   * According to cuDF documentation, Hybrid Scan benefits when:
+   * - Filter selectivity is low (< 10% of rows match)
+   * - There are many payload columns relative to filter columns
+   * 
+   * @param estimatedSelectivity Estimated filter selectivity (0.0 to 1.0)
+   * @param numFilterColumns Number of filter columns
+   * @param numPayloadColumns Number of payload columns
+   * @param threshold Selectivity threshold from config
+   * @return true if Hybrid Scan is recommended
+   */
+  def isHybridScanBeneficial(
+      estimatedSelectivity: Double,
+      numFilterColumns: Int,
+      numPayloadColumns: Int,
+      threshold: Double): Boolean = {
+    
+    // Primary criterion: selectivity must be below threshold
+    if (estimatedSelectivity > threshold) {
+      logInfo(f"Hybrid Scan not beneficial: selectivity $estimatedSelectivity%.2f > " +
+        f"threshold $threshold%.2f")
+      return false
+    }
+    
+    // Secondary criterion: payload columns should be significant
+    // If most columns are filter columns, there's no benefit
+    val payloadRatio = numPayloadColumns.toDouble / (numFilterColumns + numPayloadColumns)
+    if (payloadRatio < 0.3) {
+      logInfo(f"Hybrid Scan not beneficial: payload ratio $payloadRatio%.2f < 0.3")
+      return false
+    }
+    
+    logInfo(f"Hybrid Scan beneficial: selectivity=$estimatedSelectivity%.2f, " +
+      f"payloadRatio=$payloadRatio%.2f")
+    true
+  }
+}
+
+/**
+ * Result of page index detection in a Parquet file.
+ */
+case class PageIndexInfo(
+    hasColumnIndex: Boolean,
+    hasOffsetIndex: Boolean,
+    pageIndexByteRange: (Long, Long)) {
+  
+  def hasFullPageIndex: Boolean = hasColumnIndex && hasOffsetIndex
+  def hasAnyPageIndex: Boolean = hasColumnIndex || hasOffsetIndex
+}
+
+/**
+ * Utility object for detecting page index presence in Parquet files.
+ */
+object PageIndexDetector extends Logging {
+
+  /**
+   * Detect if a Parquet file has page index information.
+   * Page index consists of:
+   * - Column Index: min/max statistics per page
+   * - Offset Index: page locations and row counts
+   * 
+   * Both are required for effective page-level pruning in Hybrid Scan.
+   * 
+   * @param hybridScanReader The ParquetHybridScan reader with parsed footer
+   * @return PageIndexInfo with detection results
+   */
+  def detectPageIndex(hybridScanReader: ParquetHybridScan): PageIndexInfo = {
+    try {
+      val pageIndexRange = hybridScanReader.getPageIndexByteRange()
+      val offset = pageIndexRange(0)
+      val length = pageIndexRange(1)
+      
+      // If byte range length > 0, page index is present
+      val hasPageIndex = length > 0
+      
+      logDebug(s"Page index detection: offset=$offset, length=$length, " +
+        s"hasPageIndex=$hasPageIndex")
+      
+      // cuDF only exposes combined page index range, so we assume both parts are present
+      PageIndexInfo(
+        hasColumnIndex = hasPageIndex,
+        hasOffsetIndex = hasPageIndex,
+        pageIndexByteRange = (offset, length))
+    } catch {
+      case e: Exception =>
+        logDebug(s"Page index detection failed: ${e.getMessage}")
+        PageIndexInfo(
+          hasColumnIndex = false,
+          hasOffsetIndex = false,
+          pageIndexByteRange = (0L, 0L))
+    }
+  }
+
+  /**
+   * Check if page index pruning should be enabled for this file.
+   * 
+   * @param configEnabled Whether page index is enabled in config
+   * @param pageIndexInfo Detection result from file
+   * @return true if page index pruning should be used
+   */
+  def shouldUsePageIndex(configEnabled: Boolean, pageIndexInfo: PageIndexInfo): Boolean = {
+    if (!configEnabled) {
+      logDebug("Page index disabled by configuration")
+      return false
+    }
+    
+    if (!pageIndexInfo.hasFullPageIndex) {
+      logInfo("Page index disabled: file does not have complete page index " +
+        s"(columnIndex=${pageIndexInfo.hasColumnIndex}, " +
+        s"offsetIndex=${pageIndexInfo.hasOffsetIndex})")
+      return false
+    }
+    
+    logInfo(s"Page index enabled: byte range " +
+      s"${pageIndexInfo.pageIndexByteRange._1}-${pageIndexInfo.pageIndexByteRange._2}")
+    true
   }
 }
 
@@ -252,14 +546,17 @@ object HybridScanThreadPool extends Logging {
 
 /**
  * A PartitionReader that uses cuDF Hybrid Scan for reading Parquet files
- * with row group level parallel IO.
+ * with row group level parallel IO and selectivity-based optimization.
  * 
  * Hybrid Scan is optimized for highly selective filters. It reads the file in two passes:
  * 1. First pass: Read only filter columns and build a row mask
  * 2. Second pass: Read only payload columns using the row mask to skip unnecessary data
  * 
- * With parallel IO enabled, multiple row groups can be read concurrently using
- * a thread pool, significantly improving IO throughput for files with many row groups.
+ * Key optimizations:
+ * - Selectivity estimation: Only uses Hybrid Scan when filter is selective enough
+ * - Page index detection: Automatically detects and uses page index for better pruning
+ * - Parallel IO: Multiple row groups can be read concurrently
+ * - Pipelined I/O: Overlaps filter and payload column reading (when enabled)
  */
 @nowarn("msg=never used")
 class CudfHybridScanPartitionReader(
@@ -269,17 +566,37 @@ class CudfHybridScanPartitionReader(
     readSchema: StructType,
     filterColumns: Array[String],
     payloadColumns: Array[String],
-    usePageIndex: Boolean,
+    usePageIndexConfig: Boolean,  // Renamed: config setting, may be overridden
     useBloomFilter: Boolean,
     parallelIOEnabled: Boolean,
     numIOThreads: Int,
     maxRowGroupsParallel: Int,
+    selectivityThreshold: Double,  // Added: threshold for Hybrid Scan benefit
+    pipeliningEnabled: Boolean,    // Added: enable intra-file I/O pipelining
     metrics: Map[String, GpuMetric],
     dataFilters: Seq[Expression] = Seq.empty) extends PartitionReader[ColumnarBatch] with Logging {
 
   private var batch: Option[ColumnarBatch] = None
   private var hasNextBatch = true
   private var hybridScanReader: ParquetHybridScan = _
+  
+  // Dynamic page index state - determined at runtime
+  private var effectiveUsePageIndex: Boolean = usePageIndexConfig
+  private var pageIndexInfo: Option[PageIndexInfo] = None
+  
+  // Selectivity estimation state
+  private var estimatedSelectivity: Double = 1.0
+  private var hybridScanBeneficial: Boolean = true  // Assume beneficial until checked
+  
+  // Pipelining state - for async I/O
+  private val pipelineExecutor: ExecutorService = if (pipeliningEnabled) {
+    Executors.newFixedThreadPool(2, new ThreadFactoryBuilder()
+      .setDaemon(true)
+      .setNameFormat("cudf-hybrid-scan-pipeline-%d")
+      .build())
+  } else {
+    null
+  }
   
   // Schema in cuDF column order: filterColumns + payloadColumns
   // This is important for AST column index binding - cuDF reads columns in this order
@@ -359,6 +676,8 @@ class CudfHybridScanPartitionReader(
     try {
       val result = if (parallelIOEnabled) {
         readWithParallelHybridScan()
+      } else if (pipeliningEnabled) {
+        readWithPipelinedHybridScan()
       } else {
         readWithHybridScan()
       }
@@ -403,6 +722,10 @@ class CudfHybridScanPartitionReader(
     }
     // Close compiled AST filter to release native resources
     compiledAstFilter.foreach(_.close())
+    // Shutdown pipeline executor if used
+    if (pipelineExecutor != null) {
+      pipelineExecutor.shutdownNow()
+    }
   }
 
   /**
@@ -507,12 +830,17 @@ class CudfHybridScanPartitionReader(
 
         logDebug(s"After stats filtering: ${rowGroupIndices.length} row groups remaining")
 
-        // Setup page index if enabled
-        if (usePageIndex) {
-          val pageIndexRange = hybridScanReader.getPageIndexByteRange()
-          if (pageIndexRange(1) > 0) {
+        // Dynamic page index detection
+        pageIndexInfo = Some(PageIndexDetector.detectPageIndex(hybridScanReader))
+        effectiveUsePageIndex = PageIndexDetector.shouldUsePageIndex(
+          usePageIndexConfig, pageIndexInfo.get)
+        
+        // Setup page index if enabled and detected
+        if (effectiveUsePageIndex) {
+          val range = pageIndexInfo.get.pageIndexByteRange
+          if (range._2 > 0) {
             val pageIndexBuffer = readTime.ns {
-              readByteRange(fs, filePath, pageIndexRange(0), pageIndexRange(1).toInt)
+              readByteRange(fs, filePath, range._1, range._2.toInt)
             }
             withResource(pageIndexBuffer) { pib =>
               hybridScanReader.setupPageIndex(pib, 0, pib.getLength)
@@ -526,10 +854,10 @@ class CudfHybridScanPartitionReader(
           return null
         }
 
-        // Build row mask using page index if available
+        // Build row mask using page index if available and enabled
         // Note: buildRowMaskWithPageIndex requires a filter expression.
         // Skip page index filtering if no filter expression is available.
-        val rowMask = if (usePageIndex) {
+        val rowMask = if (effectiveUsePageIndex) {
           try {
             rowMaskTime.ns {
               hybridScanReader.buildRowMaskWithPageIndex(rowGroupIndices)
@@ -760,7 +1088,7 @@ class CudfHybridScanPartitionReader(
           val payloadTable = payloadColTime.ns {
             hybridScanReader.materializePayloadColumns(
               rowGroupIndices, payloadAddrs, payloadSizes,
-              rowMask.getNativeView, usePageIndex)
+              rowMask.getNativeView, effectiveUsePageIndex)
           }
           payloadTable
       } else {
@@ -770,7 +1098,7 @@ class CudfHybridScanPartitionReader(
           val filterTable = filterColTime.ns {
             hybridScanReader.materializeFilterColumns(
               rowGroupIndices, filterAddrs, filterSizes,
-              rowMask.getNativeView, usePageIndex)
+              rowMask.getNativeView, effectiveUsePageIndex)
           }
           
           try {
@@ -779,7 +1107,7 @@ class CudfHybridScanPartitionReader(
             val payloadTable = payloadColTime.ns {
               hybridScanReader.materializePayloadColumns(
                 rowGroupIndices, payloadAddrs, payloadSizes,
-                rowMask.getNativeView, usePageIndex)
+                rowMask.getNativeView, effectiveUsePageIndex)
             }
 
           // Combine tables - this will close filterTable and payloadTable
@@ -799,7 +1127,8 @@ class CudfHybridScanPartitionReader(
   }
 
   /**
-   * Read the Parquet file using sequential hybrid scan (original implementation).
+   * Read the Parquet file using sequential hybrid scan with optimization checks.
+   * Includes selectivity estimation and dynamic page index detection.
    */
   private def readWithHybridScan(): ColumnarBatch = {
     logInfo(s"cuDF Hybrid Scan reading ${filePath} with " +
@@ -829,11 +1158,17 @@ class CudfHybridScanPartitionReader(
           return null
         }
 
+        // Get total rows before filtering for selectivity estimation
+        val totalRowsBeforeFilter = hybridScanReader.getTotalRowsInRowGroups(rowGroupIndices)
+        
         // Filter row groups with statistics. Skip if no filter expression.
+        var rowGroupsFilteredByStats = 0
         try {
-          rowGroupIndices = statsFilterTime.ns {
+          val filteredIndices = statsFilterTime.ns {
             hybridScanReader.filterRowGroupsWithStats(rowGroupIndices)
           }
+          rowGroupsFilteredByStats = rowGroupIndices.length - filteredIndices.length
+          rowGroupIndices = filteredIndices
           if (rowGroupIndices.isEmpty) {
             logDebug("All row groups filtered out by statistics")
             return null
@@ -848,13 +1183,40 @@ class CudfHybridScanPartitionReader(
             throw e
         }
 
+        // Estimate selectivity based on row group pruning results
+        val totalRowsAfterFilter = hybridScanReader.getTotalRowsInRowGroups(rowGroupIndices)
+        estimatedSelectivity = if (totalRowsBeforeFilter > 0) {
+          totalRowsAfterFilter.toDouble / totalRowsBeforeFilter
+        } else {
+          1.0
+        }
+        
+        // Check if Hybrid Scan is beneficial based on selectivity
+        hybridScanBeneficial = CudfHybridScanUtils.isHybridScanBeneficial(
+          estimatedSelectivity,
+          filterColumns.length,
+          payloadColumns.length,
+          selectivityThreshold)
+        
+        logInfo(f"Selectivity estimation: $estimatedSelectivity%.4f " +
+          f"(${rowGroupsFilteredByStats}/${rowGroupIndices.length + rowGroupsFilteredByStats} " +
+          s"row groups pruned), beneficial=$hybridScanBeneficial")
+        
+        // Note: We continue even if not beneficial since we've already started
+        // In future, this could trigger fallback to regular scan
+
         logDebug(s"After stats filtering: ${rowGroupIndices.length} row groups remaining")
 
-        if (usePageIndex) {
-          val pageIndexRange = hybridScanReader.getPageIndexByteRange()
-          if (pageIndexRange(1) > 0) {
+        // Dynamic page index detection
+        pageIndexInfo = Some(PageIndexDetector.detectPageIndex(hybridScanReader))
+        effectiveUsePageIndex = PageIndexDetector.shouldUsePageIndex(
+          usePageIndexConfig, pageIndexInfo.get)
+        
+        if (effectiveUsePageIndex) {
+          val range = pageIndexInfo.get.pageIndexByteRange
+          if (range._2 > 0) {
             val pageIndexBuffer = readTime.ns {
-              readByteRange(fs, filePath, pageIndexRange(0), pageIndexRange(1).toInt)
+              readByteRange(fs, filePath, range._1, range._2.toInt)
             }
             withResource(pageIndexBuffer) { pib =>
               hybridScanReader.setupPageIndex(pib, 0, pib.getLength)
@@ -862,14 +1224,14 @@ class CudfHybridScanPartitionReader(
           }
         }
 
-        val totalRows = hybridScanReader.getTotalRowsInRowGroups(rowGroupIndices)
+        val totalRows = totalRowsAfterFilter
         if (totalRows == 0) {
           return null
         }
 
-        // Build row mask using page index if available.
+        // Build row mask using page index if available and enabled.
         // Skip page index filtering if no filter expression.
-        val rowMask = if (usePageIndex) {
+        val rowMask = if (effectiveUsePageIndex) {
           try {
             rowMaskTime.ns {
               hybridScanReader.buildRowMaskWithPageIndex(rowGroupIndices)
@@ -943,7 +1305,7 @@ class CudfHybridScanPartitionReader(
               val payloadTable = payloadColTime.ns {
                 hybridScanReader.materializePayloadColumns(
                   fallbackRowGroupIndices, payloadAddrs, payloadSizes,
-                  rowMask.getNativeView, usePageIndex)
+                  rowMask.getNativeView, effectiveUsePageIndex)
               }
                 // Must close table after creating batch
                 return withResource(payloadTable) { table =>
@@ -968,7 +1330,7 @@ class CudfHybridScanPartitionReader(
           val filterTable = filterColTime.ns {
             hybridScanReader.materializeFilterColumns(
               rowGroupIndices, filterAddrs, filterSizes,
-              rowMask.getNativeView, usePageIndex)
+              rowMask.getNativeView, effectiveUsePageIndex)
           }
 
           // Try to get payload ranges - may fail if cuDF requires filter expression
@@ -995,7 +1357,7 @@ class CudfHybridScanPartitionReader(
           val payloadTable = payloadColTime.ns {
             hybridScanReader.materializePayloadColumns(
               rowGroupIndices, payloadAddrs, payloadSizes,
-              rowMask.getNativeView, usePageIndex)
+              rowMask.getNativeView, effectiveUsePageIndex)
           }
 
                 // combineFilterAndPayloadTables will close both tables
@@ -1031,6 +1393,217 @@ class CudfHybridScanPartitionReader(
       case e: Exception =>
         logWarning(s"Hybrid scan failed: ${e.getMessage}", e)
         // Clean up the reader on exception
+        if (hybridScanReader != null) {
+          hybridScanReader.close()
+          hybridScanReader = null
+        }
+        null
+    }
+  }
+
+  /**
+   * Read the Parquet file using pipelined hybrid scan.
+   * This overlaps filter column I/O with payload column I/O to improve throughput.
+   * 
+   * Pipeline stages:
+   * 1. Read footer and setup → 2. Filter I/O (async) → 3. Payload I/O (async, overlapped)
+   *                         → 4. Filter GPU materialize → 5. Payload GPU materialize
+   */
+  private def readWithPipelinedHybridScan(): ColumnarBatch = {
+    logInfo(s"cuDF Pipelined Hybrid Scan reading ${filePath} with " +
+      s"filter columns: [${filterColumns.mkString(", ")}], " +
+      s"payload columns: [${payloadColumns.mkString(", ")}]")
+
+    val fs = filePath.getFileSystem(conf)
+    val fileStatus = fs.getFileStatus(filePath)
+
+    GpuSemaphore.acquireIfNecessary(TaskContext.get())
+
+    val footerBuffer = readTime.ns {
+      readFooterBytes(fs, filePath, fileStatus.getLen)
+    }
+
+    try {
+      withResource(footerBuffer) { footer =>
+        hybridScanReader = new ParquetHybridScan(
+          footer, 0, footer.getLength,
+          filterColumns, payloadColumns,
+          15, // DType.TIMESTAMP_MICROSECONDS.typeId
+          getAstFilterHandle
+        )
+
+        var rowGroupIndices = hybridScanReader.getAllRowGroups()
+        if (rowGroupIndices.isEmpty) {
+          return null
+        }
+
+        // Get total rows before filtering for selectivity estimation
+        val totalRowsBeforeFilter = hybridScanReader.getTotalRowsInRowGroups(rowGroupIndices)
+        
+        // Filter row groups with statistics
+        var rowGroupsFilteredByStats = 0
+        try {
+          val filteredIndices = statsFilterTime.ns {
+            hybridScanReader.filterRowGroupsWithStats(rowGroupIndices)
+          }
+          rowGroupsFilteredByStats = rowGroupIndices.length - filteredIndices.length
+          rowGroupIndices = filteredIndices
+          if (rowGroupIndices.isEmpty) {
+            logDebug("All row groups filtered out by statistics")
+            return null
+          }
+        } catch {
+          case e: Exception if e.getMessage != null &&
+              e.getMessage.contains("empty converted filter expression") =>
+            logWarning("Pipelined scan: empty filter, skipping stats filtering")
+          case e: Exception =>
+            throw e
+        }
+
+        // Estimate selectivity
+        val totalRowsAfterFilter = hybridScanReader.getTotalRowsInRowGroups(rowGroupIndices)
+        estimatedSelectivity = if (totalRowsBeforeFilter > 0) {
+          totalRowsAfterFilter.toDouble / totalRowsBeforeFilter
+        } else {
+          1.0
+        }
+        
+        logInfo(f"Pipelined scan: selectivity=$estimatedSelectivity%.4f, " +
+          s"${rowGroupsFilteredByStats} row groups pruned")
+
+        // Dynamic page index detection
+        pageIndexInfo = Some(PageIndexDetector.detectPageIndex(hybridScanReader))
+        effectiveUsePageIndex = PageIndexDetector.shouldUsePageIndex(
+          usePageIndexConfig, pageIndexInfo.get)
+        
+        if (effectiveUsePageIndex) {
+          val range = pageIndexInfo.get.pageIndexByteRange
+          if (range._2 > 0) {
+            val pageIndexBuffer = readTime.ns {
+              readByteRange(fs, filePath, range._1, range._2.toInt)
+            }
+            withResource(pageIndexBuffer) { pib =>
+              hybridScanReader.setupPageIndex(pib, 0, pib.getLength)
+            }
+          }
+        }
+
+        val totalRows = totalRowsAfterFilter
+        if (totalRows == 0) {
+          return null
+        }
+
+        // Build row mask
+        val rowMask = if (effectiveUsePageIndex) {
+          try {
+            rowMaskTime.ns {
+              hybridScanReader.buildRowMaskWithPageIndex(rowGroupIndices)
+            }
+          } catch {
+            case e: Exception if e.getMessage != null &&
+                e.getMessage.contains("empty converted filter expression") =>
+              ai.rapids.cudf.ColumnVector.fromBooleans(
+                Array.fill(totalRows.toInt)(true): _*)
+            case e: Exception =>
+              throw e
+          }
+        } else {
+          ai.rapids.cudf.ColumnVector.fromBooleans(
+            Array.fill(totalRows.toInt)(true): _*)
+        }
+
+        try {
+          // Get byte ranges for filter and payload columns
+          val filterRanges = try {
+            hybridScanReader.getFilterColumnChunkRanges(rowGroupIndices)
+          } catch {
+            case e: Exception if e.getMessage != null &&
+                e.getMessage.contains("empty converted filter expression") =>
+              Array.empty[Long]
+            case e: Exception =>
+              throw e
+          }
+          
+          val payloadRanges = hybridScanReader.getPayloadColumnChunkRanges(rowGroupIndices)
+
+          // PIPELINING: Submit both I/O operations concurrently
+          val filterIOFuture: Future[Array[HostMemoryBuffer]] = if (filterRanges.nonEmpty) {
+            pipelineExecutor.submit(new Callable[Array[HostMemoryBuffer]] {
+              override def call(): Array[HostMemoryBuffer] = {
+                readTime.ns {
+                  readColumnChunksToHost(fs, filePath, filterRanges)
+                }
+              }
+            })
+          } else {
+            null
+          }
+
+          val payloadIOFuture: Future[Array[HostMemoryBuffer]] = 
+            pipelineExecutor.submit(new Callable[Array[HostMemoryBuffer]] {
+              override def call(): Array[HostMemoryBuffer] = {
+                readTime.ns {
+                  readColumnChunksToHost(fs, filePath, payloadRanges)
+                }
+              }
+            })
+
+          // Wait for filter I/O and materialize on GPU
+          val filterTable = if (filterIOFuture != null) {
+            val filterHostBuffers = filterIOFuture.get()
+            try {
+              val (filterAddrs, filterSizes) = getHostBufferAddrsAndSizes(filterHostBuffers)
+              val table = filterColTime.ns {
+                hybridScanReader.materializeFilterColumns(
+                  rowGroupIndices, filterAddrs, filterSizes,
+                  rowMask.getNativeView, effectiveUsePageIndex)
+              }
+              table
+            } finally {
+              filterHostBuffers.foreach(_.close())
+            }
+          } else {
+            null
+          }
+
+          try {
+            // Wait for payload I/O and materialize on GPU
+            val payloadHostBuffers = payloadIOFuture.get()
+            try {
+              val (payloadAddrs, payloadSizes) = getHostBufferAddrsAndSizes(payloadHostBuffers)
+              val payloadTable = payloadColTime.ns {
+                hybridScanReader.materializePayloadColumns(
+                  rowGroupIndices, payloadAddrs, payloadSizes,
+                  rowMask.getNativeView, effectiveUsePageIndex)
+              }
+
+              // Combine tables
+              val combinedTable = if (filterTable != null) {
+                combineFilterAndPayloadTables(filterTable, payloadTable)
+              } else {
+                payloadTable
+              }
+
+              withResource(combinedTable) { table =>
+                logInfo(s"[PIPELINED] Result: ${table.getRowCount} rows, " +
+                  s"${table.getNumberOfColumns} cols")
+                GpuColumnVector.from(table, readSchema.fields.map(_.dataType).toArray)
+              }
+            } finally {
+              payloadHostBuffers.foreach(_.close())
+            }
+          } catch {
+            case e: Exception =>
+              if (filterTable != null) filterTable.close()
+              throw e
+          }
+        } finally {
+          rowMask.close()
+        }
+      }
+    } catch {
+      case e: Exception =>
+        logWarning(s"Pipelined Hybrid scan failed: ${e.getMessage}", e)
         if (hybridScanReader != null) {
           hybridScanReader.close()
           hybridScanReader = null
@@ -1216,6 +1789,8 @@ object CudfHybridScanPartitionReaderFactory extends Logging {
       rapidsConf.cudfHybridScanParallelIOEnabled,
       rapidsConf.cudfHybridScanParallelIONumThreads,
       rapidsConf.cudfHybridScanMaxRowGroupsParallel,
+      rapidsConf.cudfHybridScanSelectivityThreshold,  // Selectivity threshold for benefit check
+      rapidsConf.cudfHybridScanPipeliningEnabled,     // Pipelining for I/O overlap
       metrics,
       dataFilters  // Pass dataFilters for filter expression support
     ))
