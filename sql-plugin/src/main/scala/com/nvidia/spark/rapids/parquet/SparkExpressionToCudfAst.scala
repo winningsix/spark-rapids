@@ -21,7 +21,7 @@ import com.nvidia.spark.rapids.{GpuExpression, GpuOverrides, RapidsConf}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.types.{DateType, StructType, TimestampType}
+import org.apache.spark.sql.types.StructType
 
 /**
  * Utility object to convert Spark Catalyst Expressions to cuDF AST expressions.
@@ -32,22 +32,20 @@ import org.apache.spark.sql.types.{DateType, StructType, TimestampType}
 object SparkExpressionToCudfAst extends Logging {
 
   /**
-   * Preprocess filters to convert DATE/TIMESTAMP equality comparisons to range comparisons.
+   * Preprocess filters to convert equality comparisons to range comparisons.
    * This is needed because GpuEqualTo converts to NOT(NOT_EQUAL(...)) which doesn't work
-   * correctly with cuDF's statistics-based row group filtering.
+   * correctly with cuDF's statistics-based row group filtering for certain types.
    * 
-   * Converts: date_col = literal  ->  date_col >= literal AND date_col <= literal
+   * Converts: col = literal  ->  col >= literal AND col <= literal
    */
-  private def preprocessDateEqualityFilters(filters: Seq[Expression]): Seq[Expression] = {
+  private def preprocessEqualityFilters(filters: Seq[Expression]): Seq[Expression] = {
     filters.flatMap { filter =>
       filter match {
-        case EqualTo(attr: AttributeReference, lit: Literal) 
-            if attr.dataType.isInstanceOf[DateType] || attr.dataType.isInstanceOf[TimestampType] =>
-          logInfo(s"[AST Preprocess] Converting DATE/TIMESTAMP equality to range: ${filter.sql}")
+        case EqualTo(attr: AttributeReference, lit: Literal) =>
+          logInfo(s"[AST Preprocess] Converting equality to range: ${filter.sql}")
           Seq(GreaterThanOrEqual(attr, lit), LessThanOrEqual(attr, lit))
-        case EqualTo(lit: Literal, attr: AttributeReference)
-            if attr.dataType.isInstanceOf[DateType] || attr.dataType.isInstanceOf[TimestampType] =>
-          logInfo(s"[AST Preprocess] Converting DATE/TIMESTAMP equality to range: ${filter.sql}")
+        case EqualTo(lit: Literal, attr: AttributeReference) =>
+          logInfo(s"[AST Preprocess] Converting equality to range: ${filter.sql}")
           Seq(GreaterThanOrEqual(attr, lit), LessThanOrEqual(attr, lit))
         case _ => Seq(filter)
       }
@@ -79,8 +77,8 @@ object SparkExpressionToCudfAst extends Logging {
       return None
     }
 
-    // Preprocess DATE/TIMESTAMP equality filters to range filters
-    val preprocessedFilters = preprocessDateEqualityFilters(filters)
+    // Preprocess equality filters to range filters (works better with stats filtering)
+    val preprocessedFilters = preprocessEqualityFilters(filters)
 
     try {
       // Debug: log filter expression types
