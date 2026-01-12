@@ -24,9 +24,9 @@ import scala.collection.mutable.ArrayBuffer
 import ai.rapids.cudf.{ColumnVector, HostMemoryBuffer, Table}
 import ai.rapids.cudf.ast.CompiledExpression
 import com.nvidia.spark.rapids.{GpuColumnVector, GpuMetric, GpuSemaphore, NoopMetric,
-  RapidsConf, ThreadFactoryBuilder}
+  RapidsConf, RmmRapidsRetryIterator, ThreadFactoryBuilder}
 import com.nvidia.spark.rapids.Arm.withResource
-import com.nvidia.spark.rapids.jni.ParquetHybridScan
+import com.nvidia.spark.rapids.jni.{ParquetHybridScan, RmmSpark}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, FSDataInputStream, Path}
 
@@ -439,6 +439,7 @@ case class RowGroupReadResult(
 
 /**
  * Task for reading column chunks of a single row group in parallel.
+ * Registers as a pool thread for OOM framework coordination.
  */
 class RowGroupIOTask(
     fs: FileSystem,
@@ -446,9 +447,25 @@ class RowGroupIOTask(
     rowGroupIndex: Int,
     filterRanges: Array[Long],  // pairs of (offset, size)
     payloadRanges: Array[Long], // pairs of (offset, size)
-    numRows: Long) extends Callable[RowGroupReadResult] with Logging {
+    numRows: Long,
+    taskId: Long = -1L) extends Callable[RowGroupReadResult] with Logging {
 
   override def call(): RowGroupReadResult = {
+    // Register as pool thread working on this task for OOM framework
+    if (taskId >= 0) {
+      RmmSpark.poolThreadWorkingOnTask(taskId)
+    }
+    try {
+      doRead()
+    } finally {
+      // Unregister from OOM framework
+      if (taskId >= 0) {
+        RmmSpark.poolThreadFinishedForTasks(Array(taskId))
+      }
+    }
+  }
+
+  private def doRead(): RowGroupReadResult = {
     val filterBuffers = new ArrayBuffer[HostMemoryBuffer]()
     val payloadBuffers = new ArrayBuffer[HostMemoryBuffer]()
     
@@ -674,23 +691,26 @@ class CudfHybridScanPartitionReader(
     batch = None
 
     try {
-      val result = if (parallelIOEnabled) {
-        readWithParallelHybridScan()
-      } else if (pipeliningEnabled) {
-        readWithPipelinedHybridScan()
-      } else {
-        readWithHybridScan()
+      // Wrap read operations with OOM retry mechanism
+      val result = RmmRapidsRetryIterator.withRetryNoSplit[ColumnarBatch] {
+        if (parallelIOEnabled) {
+          readWithParallelHybridScan()
+        } else if (pipeliningEnabled) {
+          readWithPipelinedHybridScan()
+        } else {
+          readWithHybridScan()
+        }
       }
       // Always set hasNextBatch = false after reading - Hybrid Scan reads the entire file at once
       hasNextBatch = false
       if (result != null) {
         logInfo(s"[HYBRID DEBUG] next() returning batch with ${result.numRows()} rows")
         if (result.numRows() > 0) {
-        batch = Some(result)
-        numOutputBatches += 1
-        numOutputRows += result.numRows()
-        true
-      } else {
+          batch = Some(result)
+          numOutputBatches += 1
+          numOutputRows += result.numRows()
+          true
+        } else {
           logInfo(s"[HYBRID DEBUG] Closing empty batch")
           result.close()
           false
@@ -1030,8 +1050,13 @@ class CudfHybridScanPartitionReader(
             }
           }
           
+          // Get task ID for OOM framework registration
+          val currentTaskId = TaskContext.get() match {
+            case null => -1L
+            case tc => tc.taskAttemptId()
+          }
           val task = new RowGroupIOTask(fs, filePath, rgIndex, 
-            filterRanges.getOrElse(Array.empty[Long]), payloadRanges, numRows)
+            filterRanges.getOrElse(Array.empty[Long]), payloadRanges, numRows, currentTaskId)
           futures += executor.submit(task)
           submitted += 1
         }
@@ -1526,12 +1551,24 @@ class CudfHybridScanPartitionReader(
           
           val payloadRanges = hybridScanReader.getPayloadColumnChunkRanges(rowGroupIndices)
 
-          // PIPELINING: Submit both I/O operations concurrently
+          // Get task ID for OOM framework registration
+          val taskContext = TaskContext.get()
+          val taskId = if (taskContext != null) taskContext.taskAttemptId() else -1L
+
+          // Release semaphore before async I/O to allow other tasks to use GPU
+          GpuSemaphore.releaseIfNecessary(taskContext)
+
+          // PIPELINING: Submit both I/O operations concurrently with pool thread registration
           val filterIOFuture: Future[Array[HostMemoryBuffer]] = if (filterRanges.nonEmpty) {
             pipelineExecutor.submit(new Callable[Array[HostMemoryBuffer]] {
               override def call(): Array[HostMemoryBuffer] = {
-                readTime.ns {
-                  readColumnChunksToHost(fs, filePath, filterRanges)
+                if (taskId >= 0) RmmSpark.poolThreadWorkingOnTask(taskId)
+                try {
+                  readTime.ns {
+                    readColumnChunksToHost(fs, filePath, filterRanges)
+                  }
+                } finally {
+                  if (taskId >= 0) RmmSpark.poolThreadFinishedForTasks(Array(taskId))
                 }
               }
             })
@@ -1542,15 +1579,26 @@ class CudfHybridScanPartitionReader(
           val payloadIOFuture: Future[Array[HostMemoryBuffer]] = 
             pipelineExecutor.submit(new Callable[Array[HostMemoryBuffer]] {
               override def call(): Array[HostMemoryBuffer] = {
-                readTime.ns {
-                  readColumnChunksToHost(fs, filePath, payloadRanges)
+                if (taskId >= 0) RmmSpark.poolThreadWorkingOnTask(taskId)
+                try {
+                  readTime.ns {
+                    readColumnChunksToHost(fs, filePath, payloadRanges)
+                  }
+                } finally {
+                  if (taskId >= 0) RmmSpark.poolThreadFinishedForTasks(Array(taskId))
                 }
               }
             })
 
-          // Wait for filter I/O and materialize on GPU
-          val filterTable = if (filterIOFuture != null) {
-            val filterHostBuffers = filterIOFuture.get()
+          // Wait for I/O to complete before re-acquiring semaphore
+          val filterHostBuffers = if (filterIOFuture != null) filterIOFuture.get() else null
+          val payloadHostBuffers = payloadIOFuture.get()
+
+          // Re-acquire semaphore for GPU materialization
+          GpuSemaphore.acquireIfNecessary(taskContext)
+
+          // Materialize filter columns on GPU
+          val filterTable = if (filterHostBuffers != null) {
             try {
               val (filterAddrs, filterSizes) = getHostBufferAddrsAndSizes(filterHostBuffers)
               val table = filterColTime.ns {
@@ -1567,8 +1615,7 @@ class CudfHybridScanPartitionReader(
           }
 
           try {
-            // Wait for payload I/O and materialize on GPU
-            val payloadHostBuffers = payloadIOFuture.get()
+            // Materialize payload columns on GPU
             try {
               val (payloadAddrs, payloadSizes) = getHostBufferAddrsAndSizes(payloadHostBuffers)
               val payloadTable = payloadColTime.ns {
