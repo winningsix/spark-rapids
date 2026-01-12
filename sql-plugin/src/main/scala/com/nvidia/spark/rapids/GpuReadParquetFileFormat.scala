@@ -16,26 +16,33 @@
 
 package com.nvidia.spark.rapids
 
-import com.nvidia.spark.rapids.parquet.{GpuParquetMultiFilePartitionReaderFactory, GpuParquetPartitionReaderFactory, GpuParquetScan}
+import scala.collection.JavaConverters._
+
+import com.nvidia.spark.rapids.parquet.{CudfHybridScanUtils,
+  GpuParquetHybridScanPartitionReaderFactory, GpuParquetMultiFilePartitionReaderFactory,
+  GpuParquetPartitionReaderFactory, GpuParquetScan}
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.connector.read.PartitionReaderFactory
 import org.apache.spark.sql.execution.FileSourceScanExec
-import org.apache.spark.sql.execution.datasources.PartitionedFile
+import org.apache.spark.sql.execution.datasources.{PartitionedFile, PartitioningAwareFileIndex}
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.rapids.GpuFileSourceScanExec
 import org.apache.spark.sql.rapids.shims.SparkSessionUtils
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.SerializableConfiguration
 
 /**
  * A FileFormat that allows reading Parquet files with the GPU.
  */
-class GpuReadParquetFileFormat extends ParquetFileFormat with GpuReadFileFormatWithMetrics {
+class GpuReadParquetFileFormat extends ParquetFileFormat
+    with GpuReadFileFormatWithMetrics with Logging {
   override def buildReaderWithPartitionValuesAndMetrics(
       sparkSession: SparkSession,
       dataSchema: StructType,
@@ -68,18 +75,84 @@ class GpuReadParquetFileFormat extends ParquetFileFormat with GpuReadFileFormatW
       broadcastedConf: Broadcast[SerializableConfiguration],
       pushedFilters: Array[Filter],
       fileScan: GpuFileSourceScanExec): PartitionReaderFactory = {
-    val poolConf = ThreadPoolConfBuilder(fileScan.rapidsConf)
-    GpuParquetMultiFilePartitionReaderFactory(
-      fileScan.conf,
-      broadcastedConf,
+    // Use GpuParquetScan to create the reader factory so that Hybrid Scan can be enabled
+    val hadoopConf = fileScan.sparkSession.sessionState.newHadoopConfWithOptions(
+      fileScan.relation.options)
+    val fileIndex = fileScan.relation.location match {
+      case p: PartitioningAwareFileIndex => p
+      case _ => throw new IllegalStateException("FileIndex must be PartitioningAwareFileIndex")
+    }
+    // Convert CaseInsensitiveMap to CaseInsensitiveStringMap
+    val optionsMap = fileScan.relation.options match {
+      case m: CaseInsensitiveStringMap => m
+      case m: Map[_, _] => 
+        // Convert Map[String, String] to CaseInsensitiveStringMap
+        val stringMap = m.asInstanceOf[Map[String, String]]
+        new CaseInsensitiveStringMap(stringMap.asJava)
+      case _ =>
+        // Fallback: try to convert to Map first
+        val map = fileScan.relation.options.asInstanceOf[Map[String, String]]
+        new CaseInsensitiveStringMap(map.asJava)
+    }
+    val gpuParquetScan = GpuParquetScan(
+      fileScan.sparkSession,
+      hadoopConf,
+      fileIndex,
       fileScan.relation.dataSchema,
       fileScan.requiredSchema,
       fileScan.readPartitionSchema,
       pushedFilters,
+      optionsMap,
+      fileScan.partitionFilters,
+      fileScan.dataFilters,
       fileScan.rapidsConf,
-      poolConf,
-      fileScan.allMetrics,
       fileScan.queryUsesInputFile)
+    
+    // Check if Hybrid Scan should be used
+    val useCudfHybridScan = CudfHybridScanUtils.shouldUseCudfHybridScan(
+      fileScan.rapidsConf, fileScan.dataFilters, fileScan.requiredSchema)
+    
+    val factory = if (useCudfHybridScan) {
+      // Use Hybrid Scan with correct metrics from fileScan
+      val (filterColumns, payloadColumns) = 
+        CudfHybridScanUtils.separateColumns(fileScan.requiredSchema, fileScan.dataFilters)
+      GpuParquetHybridScanPartitionReaderFactory(
+        fileScan.sparkSession.sessionState.conf,
+        broadcastedConf,
+        fileScan.relation.dataSchema,
+        fileScan.requiredSchema,
+        fileScan.readPartitionSchema,
+        pushedFilters,
+        fileScan.rapidsConf,
+        fileScan.allMetrics, // Use metrics from fileScan, not from GpuParquetScan
+        optionsMap.asScala.toMap,
+        filterColumns,
+        payloadColumns,
+        fileScan.dataFilters)
+    } else {
+      // Use GpuParquetScan to create the factory, but we need to ensure metrics are correct
+      // Since GpuParquetScan.metrics might be empty, we need to patch the factory
+      val createdFactory = gpuParquetScan.createReaderFactory()
+      // If it's GpuParquetMultiFilePartitionReaderFactory, ensure it has the right metrics
+      createdFactory match {
+        case _: GpuParquetMultiFilePartitionReaderFactory =>
+          // Create a new factory with correct metrics
+          val poolConfBuilder = ThreadPoolConfBuilder(fileScan.rapidsConf)
+          GpuParquetMultiFilePartitionReaderFactory(
+            fileScan.conf,
+            broadcastedConf,
+            fileScan.relation.dataSchema,
+            fileScan.requiredSchema,
+            fileScan.readPartitionSchema,
+            pushedFilters,
+            fileScan.rapidsConf,
+            poolConfBuilder,
+            fileScan.allMetrics, // Use metrics from fileScan
+            fileScan.queryUsesInputFile)
+        case _ => createdFactory
+      }
+    }
+    factory
   }
 }
 

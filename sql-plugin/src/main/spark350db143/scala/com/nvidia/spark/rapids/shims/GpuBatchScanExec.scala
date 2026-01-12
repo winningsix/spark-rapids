@@ -135,9 +135,16 @@ case class GpuBatchScanExec(
     }
   }
 
-  override lazy val readerFactory: PartitionReaderFactory = batch.createReaderFactory()
+  // IMPORTANT: Set metrics BEFORE creating readerFactory to ensure partition readers
+  // have access to metrics. This fixes the "output rows" metric not being updated
+  // in CudfHybridScanPartitionReader and other readers that depend on metrics.
+  override lazy val readerFactory: PartitionReaderFactory = {
+    scan.metrics = allMetrics
+    batch.createReaderFactory()
+  }
 
   override lazy val inputRDD: RDD[InternalRow] = {
+    // Ensure metrics are set (redundant but safe if readerFactory accessed first)
     scan.metrics = allMetrics
     val rdd = if (filteredPartitions.isEmpty && outputPartitioning == SinglePartition) {
       // return an empty RDD with 1 partition if dynamic filtering removed the only split

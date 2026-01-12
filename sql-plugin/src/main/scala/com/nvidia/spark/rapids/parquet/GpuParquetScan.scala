@@ -125,7 +125,20 @@ case class GpuParquetScan(
     val broadcastedConf = sparkSession.sparkContext.broadcast(
       new SerializableConfiguration(hadoopConf))
 
-    if (rapidsConf.isParquetPerFileReadEnabled) {
+    // Check if cuDF Hybrid Scan should be used for highly selective filters
+    logDebug(s"Checking cuDF Hybrid Scan: enabled=${rapidsConf.cudfHybridScanEnabled}, " +
+      s"dataFilters=${dataFilters.length}, pushedFilters=${pushedFilters.length}")
+    val useCudfHybridScan = CudfHybridScanUtils.shouldUseCudfHybridScan(
+      rapidsConf, dataFilters, readDataSchema)
+    if (useCudfHybridScan) {
+      logInfo("Using cuDF Hybrid Scan for Parquet reading with selective filters")
+      val (filterColumns, payloadColumns) = 
+        CudfHybridScanUtils.separateColumns(readDataSchema, dataFilters)
+      GpuParquetHybridScanPartitionReaderFactory(
+        sparkSession.sessionState.conf, broadcastedConf,
+        dataSchema, readDataSchema, readPartitionSchema, pushedFilters, rapidsConf, metrics,
+        options.asScala.toMap, filterColumns, payloadColumns, dataFilters)
+    } else if (rapidsConf.isParquetPerFileReadEnabled) {
       logInfo("Using the original per file parquet reader")
       GpuParquetPartitionReaderFactory(sparkSession.sessionState.conf, broadcastedConf,
         dataSchema, readDataSchema, readPartitionSchema, pushedFilters, rapidsConf, metrics,
@@ -3283,4 +3296,71 @@ object ParquetPartitionReader {
       block.getColumns.asScala.map(_.getTotalSize).sum
     }
   }
+}
+
+// TODO: Re-enable when ParquetHybridScan JNI is available
+/**
+ * A PartitionReaderFactory for cuDF Hybrid Scan.
+ * 
+ * This factory creates readers that use the two-pass hybrid scan approach:
+ * 1. First pass: Read filter columns and build row mask
+ * 2. Second pass: Read payload columns using row mask for optimal I/O
+ */
+case class GpuParquetHybridScanPartitionReaderFactory(
+    @transient sqlConf: SQLConf,
+    broadcastedConf: Broadcast[SerializableConfiguration],
+    dataSchema: StructType,
+    readDataSchema: StructType,
+    partitionSchema: StructType,
+    filters: Array[Filter],
+    @transient rapidsConf: RapidsConf,
+    metrics: Map[String, GpuMetric],
+    @transient params: Map[String, String],
+    filterColumns: Array[String],
+    payloadColumns: Array[String],
+    dataFilters: Seq[Expression])
+  extends ShimFilePartitionReaderFactory(params) with Logging {
+
+  // Extract configuration values in constructor before serialization
+  private val usePageIndex = rapidsConf.cudfHybridScanUsePageIndex
+  private val useBloomFilter = rapidsConf.cudfHybridScanUseBloomFilter
+  private val parallelIOEnabled = rapidsConf.cudfHybridScanParallelIOEnabled
+  private val numIOThreads = rapidsConf.cudfHybridScanParallelIONumThreads
+  private val maxRowGroupsParallel = rapidsConf.cudfHybridScanMaxRowGroupsParallel
+
+  override def buildReader(partitionedFile: PartitionedFile): PartitionReader[InternalRow] = {
+    throw new IllegalStateException("GPU column parser called to read rows")
+  }
+
+  override def buildColumnarReader(
+      partitionedFile: PartitionedFile): PartitionReader[ColumnarBatch] = {
+    
+    val conf = broadcastedConf.value.value
+    val filePath = new Path(new URI(partitionedFile.filePath.toString()))
+    
+
+    logInfo(s"Creating cuDF Hybrid Scan reader for ${filePath}")
+    logDebug(s"Filter columns: [${filterColumns.mkString(", ")}]")
+    logDebug(s"Payload columns: [${payloadColumns.mkString(", ")}]")
+
+    // Create the hybrid scan partition reader with extracted config values
+    // Now passing dataFilters to enable filter expression conversion
+    new CudfHybridScanPartitionReader(
+      conf,
+      partitionedFile,
+      filePath,
+      readDataSchema,
+      filterColumns,
+      payloadColumns,
+      usePageIndex,
+      useBloomFilter,
+      parallelIOEnabled,
+      numIOThreads,
+      maxRowGroupsParallel,
+      metrics,
+      dataFilters  // Pass dataFilters for filter expression conversion
+    )
+  }
+
+  override def supportColumnarReads(partition: InputPartition): Boolean = true
 }

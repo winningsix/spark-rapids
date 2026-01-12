@@ -2008,6 +2008,81 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .stringConf
     .createWithDefault("")
 
+  val CUDF_HYBRID_SCAN_ENABLED = conf("spark.rapids.sql.parquet.cudfHybridScan.enabled")
+    .doc("Enable cuDF Hybrid Scan for reading Parquet files with highly selective filters. " +
+      "This feature uses a two-pass reading strategy: first reading filter columns to build " +
+      "a row mask, then reading payload columns using the mask for optimal performance. " +
+      "Best suited for queries with selective predicates where most rows are filtered out.")
+    .internal()
+    .booleanConf
+    .createWithDefault(false)
+
+  val CUDF_HYBRID_SCAN_USE_PAGE_INDEX =
+    conf("spark.rapids.sql.parquet.cudfHybridScan.usePageIndex")
+    .doc("When cuDF Hybrid Scan is enabled, use page index statistics to prune data pages " +
+      "before reading. This can significantly reduce I/O for ordered or partially ordered data. " +
+      "Requires Parquet files to have page indexes written.")
+    .internal()
+    .booleanConf
+    .createWithDefault(false)
+
+  val CUDF_HYBRID_SCAN_USE_BLOOM_FILTER =
+    conf("spark.rapids.sql.parquet.cudfHybridScan.useBloomFilter")
+    .doc("When cuDF Hybrid Scan is enabled, use bloom filters to prune row groups " +
+      "for equality predicates. Requires bloom filters to be present in the Parquet file.")
+    .internal()
+    .booleanConf
+    .createWithDefault(false)
+
+  val CUDF_HYBRID_SCAN_SELECTIVITY_THRESHOLD = 
+    conf("spark.rapids.sql.parquet.cudfHybridScan.selectivityThreshold")
+    .doc("The selectivity threshold below which cuDF Hybrid Scan is beneficial. " +
+      "If the estimated selectivity is above this threshold, regular GPU scan will be used. " +
+      "Value should be between 0.0 and 1.0, where 0.1 means 10% selectivity.")
+    .internal()
+    .doubleConf
+    .checkValue(v => v >= 0.0 && v <= 1.0, "Selectivity threshold must be between 0.0 and 1.0")
+    .createWithDefault(0.5)
+
+  val CUDF_HYBRID_SCAN_PARALLEL_IO_ENABLED = 
+    conf("spark.rapids.sql.parquet.cudfHybridScan.parallelIO.enabled")
+    .doc("Enable parallel IO at row group level for cuDF Hybrid Scan. " +
+      "When enabled, multiple row groups will be read in parallel using a thread pool, " +
+      "which can significantly improve IO throughput for files with many row groups.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
+  val CUDF_HYBRID_SCAN_PARALLEL_IO_NUM_THREADS = 
+    conf("spark.rapids.sql.parquet.cudfHybridScan.parallelIO.numThreads")
+    .doc("The number of threads to use for parallel IO in cuDF Hybrid Scan. " +
+      "Each thread can read a different row group or column chunk concurrently. " +
+      "Set to 0 to use the default multi-threaded reader pool size.")
+    .internal()
+    .integerConf
+    .checkValue(v => v >= 0, "Thread count must be non-negative")
+    .createWithDefault(0)
+
+  val CUDF_HYBRID_SCAN_MAX_ROW_GROUPS_PARALLEL = 
+    conf("spark.rapids.sql.parquet.cudfHybridScan.parallelIO.maxRowGroupsParallel")
+    .doc("Maximum number of row groups to read in parallel for cuDF Hybrid Scan. " +
+      "This limits memory consumption by controlling how many row groups are being " +
+      "processed concurrently. Set to 0 for unlimited (bounded by thread pool size).")
+    .internal()
+    .integerConf
+    .checkValue(v => v >= 0, "Max row groups must be non-negative")
+    .createWithDefault(4)
+
+  val CUDF_HYBRID_SCAN_PREFETCH_BUFFER_SIZE = 
+    conf("spark.rapids.sql.parquet.cudfHybridScan.parallelIO.prefetchBufferSize")
+    .doc("The size of prefetch buffer in bytes for each IO thread. " +
+      "Larger buffers can improve throughput but consume more memory. " +
+      "Set to 0 to disable prefetching.")
+    .internal()
+    .bytesConf(ByteUnit.BYTE)
+    .checkValue(v => v >= 0, "Prefetch buffer size must be non-negative")
+    .createWithDefault(8 * 1024 * 1024) // 8MB default
+
   val HASH_AGG_REPLACE_MODE = conf("spark.rapids.sql.hashAgg.replaceMode")
     .doc("Only when hash aggregate exec has these modes (\"all\" by default): " +
       "\"all\" (try to replace all aggregates, default), " +
@@ -3348,6 +3423,25 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val pushDownFiltersToHybrid: String = get(PUSH_DOWN_FILTERS_TO_HYBRID)
 
   lazy val hybridExprsWhitelist: String = get(HYBRID_EXPRS_WHITELIST)
+
+  lazy val cudfHybridScanEnabled: Boolean = get(CUDF_HYBRID_SCAN_ENABLED)
+
+  lazy val cudfHybridScanUsePageIndex: Boolean = get(CUDF_HYBRID_SCAN_USE_PAGE_INDEX)
+
+  lazy val cudfHybridScanUseBloomFilter: Boolean = get(CUDF_HYBRID_SCAN_USE_BLOOM_FILTER)
+
+  lazy val cudfHybridScanSelectivityThreshold: Double = get(CUDF_HYBRID_SCAN_SELECTIVITY_THRESHOLD)
+
+  lazy val cudfHybridScanParallelIOEnabled: Boolean = get(CUDF_HYBRID_SCAN_PARALLEL_IO_ENABLED)
+
+  lazy val cudfHybridScanParallelIONumThreads: Int = {
+    val configValue = get(CUDF_HYBRID_SCAN_PARALLEL_IO_NUM_THREADS)
+    if (configValue == 0) multiThreadReadNumThreads else configValue
+  }
+
+  lazy val cudfHybridScanMaxRowGroupsParallel: Int = get(CUDF_HYBRID_SCAN_MAX_ROW_GROUPS_PARALLEL)
+
+  lazy val cudfHybridScanPrefetchBufferSize: Long = get(CUDF_HYBRID_SCAN_PREFETCH_BUFFER_SIZE)
 
   lazy val hashAggReplaceMode: String = get(HASH_AGG_REPLACE_MODE)
 
