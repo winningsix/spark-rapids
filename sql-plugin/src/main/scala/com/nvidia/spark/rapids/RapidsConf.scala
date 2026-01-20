@@ -1510,6 +1510,23 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .checkValue(v => v > 0, "The maximum number of files must be greater than 0.")
       .createWithDefault(Integer.MAX_VALUE)
 
+  val PARQUET_PRESERVE_DICT_ENCODING =
+    conf("spark.rapids.sql.format.parquet.preserveDictionaryEncoding")
+      .doc("When set to true, preserve Parquet dictionary encoding for eligible columns " +
+        "internally in cuDF during processing. This can enable dictionary-aware optimizations " +
+        "in downstream operators.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
+  val PARQUET_DICTIONARY_OUTPUT_COLUMNS =
+    conf("spark.rapids.sql.format.parquet.dictionaryOutputColumns")
+      .doc("Comma-separated list of column names to output as dictionary-encoded (DICTIONARY32). " +
+        "When set to '*', all string columns will be output as dictionary-encoded. " +
+        "This enables dictionary-aware GroupBy and Join optimizations.")
+      .stringConf
+      .createOptional
+
   val ENABLE_PARQUET_READ = conf("spark.rapids.sql.format.parquet.read.enabled")
     .doc("When set to false disables parquet input acceleration")
     .booleanConf
@@ -3428,6 +3445,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val useHybridParquetReader: Boolean = get(HYBRID_PARQUET_READER)
 
   lazy val hybridParquetPreloadBatches: Int = get(HYBRID_PARQUET_PRELOAD_CAP)
+
+  lazy val parquetPreserveDictionaryEncoding: Boolean = get(PARQUET_PRESERVE_DICT_ENCODING)
+
+  lazy val parquetDictionaryOutputColumns: Option[String] = get(PARQUET_DICTIONARY_OUTPUT_COLUMNS)
 
   lazy val loadHybridBackend: Boolean = get(LOAD_HYBRID_BACKEND)
 

@@ -1122,6 +1122,10 @@ case class GpuParquetMultiFilePartitionReaderFactory(
   private val isCaseSensitive = sqlConf.caseSensitiveAnalysis
   private val debugDumpPrefix = rapidsConf.parquetDebugDumpPrefix
   private val debugDumpAlways = rapidsConf.parquetDebugDumpAlways
+  private val preserveDictEncoding = rapidsConf.parquetPreserveDictionaryEncoding
+  private val dictOutputCols = rapidsConf.parquetDictionaryOutputColumns.map { s =>
+    if (s == "*") Seq("*") else s.split(",").map(_.trim).toSeq
+  }
   private val maxNumFileProcessed = rapidsConf.maxNumParquetFilesParallel
   private val ignoreMissingFiles = sqlConf.ignoreMissingFiles
   private val ignoreCorruptFiles = sqlConf.ignoreCorruptFiles
@@ -1314,7 +1318,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       targetBatchSizeBytes, maxGpuColumnSizeBytes,
       useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes, compressCfg,
       metrics, partitionSchema, poolConf, ignoreMissingFiles, ignoreCorruptFiles,
-      readUseFieldId)
+      readUseFieldId, preserveDictEncoding, dictOutputCols)
   }
 
   /**
@@ -1428,6 +1432,10 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
   def isSchemaCaseSensitive: Boolean
 
   def compressCfg: CpuCompressionConfig
+
+  // Dictionary late decode configuration
+  def preserveDictionaryEncoding: Boolean = false
+  def dictionaryOutputColumns: Option[Seq[String]] = None
 
   val copyBufferSize = conf.getInt("parquet.read.allocation.size", 8 * 1024 * 1024)
 
@@ -2138,10 +2146,35 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       useFieldId: Boolean): ParquetOptions = {
     val includeColumns = toCudfColumnNames(readDataSchema, clippedSchema,
       isSchemaCaseSensitive, useFieldId)
-    ParquetOptions.builder()
+    val builder = ParquetOptions.builder()
         .withTimeUnit(DType.TIMESTAMP_MICROSECONDS)
         .includeColumn(includeColumns : _*)
-        .build()
+        .withPreserveDictionaryEncoding(preserveDictionaryEncoding)
+
+    // Handle dictionary output columns
+    dictionaryOutputColumns.foreach { cols =>
+      if (cols.nonEmpty) {
+        import scala.collection.JavaConverters._
+        val actualCols = if (cols == Seq("*")) {
+          // If "*", use all string columns from readDataSchema
+          readDataSchema.fields
+            .filter(_.dataType.isInstanceOf[org.apache.spark.sql.types.StringType])
+            .map(_.name).toSeq
+        } else {
+          cols
+        }
+        if (actualCols.nonEmpty) {
+          logInfo(s"[DICTIONARY_LATE_DECODE] Dictionary output columns: ${actualCols.mkString(", ")}")
+          builder.withDictionaryOutputColumns(actualCols.asJava)
+        }
+      }
+    }
+
+    if (preserveDictionaryEncoding) {
+      logInfo(s"[DICTIONARY_LATE_DECODE] preserveDictionaryEncoding=true")
+    }
+
+    builder.build()
   }
 
   /** conversions used by multithreaded reader and coalescing reader */
@@ -2234,7 +2267,9 @@ class MultiFileParquetPartitionReader(
     poolConf: ThreadPoolConf,
     ignoreMissingFiles: Boolean,
     ignoreCorruptFiles: Boolean,
-    useFieldId: Boolean)
+    useFieldId: Boolean,
+    override val preserveDictionaryEncoding: Boolean = false,
+    override val dictionaryOutputColumns: Option[Seq[String]] = None)
   extends MultiFileCoalescingPartitionReaderBase(conf, clippedBlocks,
     partitionSchema, maxReadBatchSizeRows, maxReadBatchSizeBytes, maxGpuColumnSizeBytes,
     poolConf, execMetrics)
