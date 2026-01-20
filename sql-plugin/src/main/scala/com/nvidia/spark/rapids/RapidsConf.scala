@@ -1439,6 +1439,21 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(true)
 
+  val PARQUET_PRESERVE_DICT_ENCODING =
+    conf("spark.rapids.sql.format.parquet.preserveDictionaryEncoding")
+      .doc("When set to true, preserve Parquet dictionary encoding for eligible columns.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
+  val PARQUET_DICTIONARY_OUTPUT_COLUMNS =
+    conf("spark.rapids.sql.format.parquet.dictionaryOutputColumns")
+      .doc("Comma-separated list of column names to output as dictionary-encoded (DICTIONARY32). " +
+        "When set to '*', all string columns will be output as dictionary-encoded. " +
+        "This enables dictionary-aware GroupBy and Join optimizations for 1.5-4x speedup.")
+      .stringConf
+      .createOptional
+
   val ENABLE_PARQUET_WRITE = conf("spark.rapids.sql.format.parquet.write.enabled")
     .doc("When set to false disables parquet output acceleration")
     .booleanConf
@@ -3415,6 +3430,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val parquetDebugDumpPrefix: Option[String] = get(PARQUET_DEBUG_DUMP_PREFIX)
 
   lazy val parquetDebugDumpAlways: Boolean = get(PARQUET_DEBUG_DUMP_ALWAYS)
+
+  lazy val parquetPreserveDictionaryEncoding: Boolean = get(PARQUET_PRESERVE_DICT_ENCODING)
+
+  lazy val parquetDictionaryOutputColumns: Option[String] = get(PARQUET_DICTIONARY_OUTPUT_COLUMNS)
 
   lazy val orcDebugDumpPrefix: Option[String] = get(ORC_DEBUG_DUMP_PREFIX)
 

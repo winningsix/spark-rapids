@@ -125,20 +125,8 @@ case class GpuParquetScan(
     val broadcastedConf = sparkSession.sparkContext.broadcast(
       new SerializableConfiguration(hadoopConf))
 
-    // Check if cuDF Hybrid Scan should be used for highly selective filters
-    logDebug(s"Checking cuDF Hybrid Scan: enabled=${rapidsConf.cudfHybridScanEnabled}, " +
-      s"dataFilters=${dataFilters.length}, pushedFilters=${pushedFilters.length}")
-    val useCudfHybridScan = CudfHybridScanUtils.shouldUseCudfHybridScan(
-      rapidsConf, dataFilters, readDataSchema)
-    if (useCudfHybridScan) {
-      logInfo("Using cuDF Hybrid Scan for Parquet reading with selective filters")
-      val (filterColumns, payloadColumns) = 
-        CudfHybridScanUtils.separateColumns(readDataSchema, dataFilters)
-      GpuParquetHybridScanPartitionReaderFactory(
-        sparkSession.sessionState.conf, broadcastedConf,
-        dataSchema, readDataSchema, readPartitionSchema, pushedFilters, rapidsConf, metrics,
-        options.asScala.toMap, filterColumns, payloadColumns, dataFilters)
-    } else if (rapidsConf.isParquetPerFileReadEnabled) {
+    // cuDF Hybrid Scan disabled - ParquetHybridScan class not available
+    if (rapidsConf.isParquetPerFileReadEnabled) {
       logInfo("Using the original per file parquet reader")
       GpuParquetPartitionReaderFactory(sparkSession.sessionState.conf, broadcastedConf,
         dataSchema, readDataSchema, readPartitionSchema, pushedFilters, rapidsConf, metrics,
@@ -1168,6 +1156,13 @@ case class GpuParquetMultiFilePartitionReaderFactory(
         deprecatedVal
       }.getOrElse(rapidsConf.getMultithreadedReaderKeepOrder)
   private val compressCfg = CpuCompressionConfig.forParquet(rapidsConf)
+  
+  // Dictionary late decode configuration
+  private val preserveDictionaryEncoding = rapidsConf.parquetPreserveDictionaryEncoding
+  private val dictionaryOutputColumns: Option[Seq[String]] = 
+    rapidsConf.parquetDictionaryOutputColumns.map { cols =>
+      if (cols == "*") Seq("*") else cols.split(",").map(_.trim).filter(_.nonEmpty).toSeq
+    }
 
   // We can't use the coalescing files reader when InputFileName, InputFileBlockStart,
   // or InputFileBlockLength because we are combining all the files into a single buffer
@@ -1204,7 +1199,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       poolConf,
       maxNumFileProcessed, ignoreMissingFiles,
       ignoreCorruptFiles, readUseFieldId, queryUsesInputFile, keepReadsInOrderFromConf,
-      combineConf)
+      combineConf, preserveDictionaryEncoding, dictionaryOutputColumns)
     // NOTE: Initialize must happen after the initialization of the reader, to ensure everything
     // inside the reader being fully initialized.
     if (conf.getBoolean("rapids.sql.scan.prefetch", false)) {
@@ -1327,7 +1322,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       targetBatchSizeBytes, maxGpuColumnSizeBytes,
       useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes, compressCfg,
       metrics, partitionSchema, poolConf, ignoreMissingFiles, ignoreCorruptFiles,
-      readUseFieldId)
+      readUseFieldId, preserveDictionaryEncoding, dictionaryOutputColumns)
   }
 
   /**
@@ -1376,6 +1371,13 @@ case class GpuParquetPartitionReaderFactory(
   private val footerReadType = GpuParquetScan.footerReaderHeuristic(
     rapidsConf.parquetReaderFooterType, dataSchema, readDataSchema, readUseFieldId)
   private val compressCfg = CpuCompressionConfig.forParquet(rapidsConf)
+  
+  // Dictionary late decode configuration
+  private val preserveDictionaryEncoding = rapidsConf.parquetPreserveDictionaryEncoding
+  private val dictionaryOutputColumns: Option[Seq[String]] = 
+    rapidsConf.parquetDictionaryOutputColumns.map { cols =>
+      if (cols == "*") Seq("*") else cols.split(",").map(_.trim).filter(_.nonEmpty).toSeq
+    }
 
   override def supportColumnarReads(partition: InputPartition): Boolean = true
 
@@ -1406,7 +1408,8 @@ case class GpuParquetPartitionReaderFactory(
       maxReadBatchSizeRows, maxReadBatchSizeBytes, targetSizeBytes,
       useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes, compressCfg,
       metrics, singleFileInfo.dateRebaseMode,
-      singleFileInfo.timestampRebaseMode, singleFileInfo.hasInt96Timestamps, readUseFieldId)
+      singleFileInfo.timestampRebaseMode, singleFileInfo.hasInt96Timestamps, readUseFieldId,
+      preserveDictionaryEncoding, dictionaryOutputColumns)
   }
 }
 
@@ -1441,6 +1444,10 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
   def isSchemaCaseSensitive: Boolean
 
   def compressCfg: CpuCompressionConfig
+  
+  // Dictionary late decode configuration (override in subclasses)
+  def preserveDictionaryEncoding: Boolean = false
+  def dictionaryOutputColumns: Option[Seq[String]] = None
 
   val copyBufferSize = conf.getInt("parquet.read.allocation.size", 8 * 1024 * 1024)
 
@@ -2151,10 +2158,35 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       useFieldId: Boolean): ParquetOptions = {
     val includeColumns = toCudfColumnNames(readDataSchema, clippedSchema,
       isSchemaCaseSensitive, useFieldId)
-    ParquetOptions.builder()
+    val builder = ParquetOptions.builder()
         .withTimeUnit(DType.TIMESTAMP_MICROSECONDS)
         .includeColumn(includeColumns : _*)
-        .build()
+        .withPreserveDictionaryEncoding(preserveDictionaryEncoding)
+    
+    // Add dictionary output columns if specified
+    dictionaryOutputColumns.foreach { cols =>
+      if (cols.nonEmpty) {
+        import scala.collection.JavaConverters._
+        val actualCols = if (cols == Seq("*")) {
+          // When "*", use all string columns
+          readDataSchema.fields
+            .filter(_.dataType.isInstanceOf[org.apache.spark.sql.types.StringType])
+            .map(_.name).toSeq
+        } else {
+          cols
+        }
+        if (actualCols.nonEmpty) {
+          logInfo(s"[DICTIONARY_LATE_DECODE] Dictionary output columns: ${actualCols.mkString(", ")}")
+          builder.withDictionaryOutputColumns(actualCols.asJava)
+        }
+      }
+    }
+    
+    if (preserveDictionaryEncoding) {
+      logInfo(s"[DICTIONARY_LATE_DECODE] preserveDictionaryEncoding=true")
+    }
+    
+    builder.build()
   }
 
   /** conversions used by multithreaded reader and coalescing reader */
@@ -2247,7 +2279,9 @@ class MultiFileParquetPartitionReader(
     poolConf: ThreadPoolConf,
     ignoreMissingFiles: Boolean,
     ignoreCorruptFiles: Boolean,
-    useFieldId: Boolean)
+    useFieldId: Boolean,
+    override val preserveDictionaryEncoding: Boolean = false,
+    override val dictionaryOutputColumns: Option[Seq[String]] = None)
   extends MultiFileCoalescingPartitionReaderBase(conf, clippedBlocks,
     partitionSchema, maxReadBatchSizeRows, maxReadBatchSizeBytes, maxGpuColumnSizeBytes,
     poolConf, execMetrics)
@@ -2463,7 +2497,9 @@ class MultiFileCloudParquetPartitionReader(
     useFieldId: Boolean,
     queryUsesInputFile: Boolean,
     keepReadsInOrder: Boolean,
-    combineConf: CombineConf)
+    combineConf: CombineConf,
+    override val preserveDictionaryEncoding: Boolean = false,
+    override val dictionaryOutputColumns: Option[Seq[String]] = None)
   extends MultiFileCloudPartitionReaderBase(conf,
     files, poolConf, maxNumFileProcessed, null,
     execMetrics, maxReadBatchSizeRows, maxReadBatchSizeBytes, ignoreCorruptFiles,
@@ -3159,7 +3195,9 @@ class ParquetPartitionReader(
     dateRebaseMode: DateTimeRebaseMode,
     timestampRebaseMode: DateTimeRebaseMode,
     hasInt96Timestamps: Boolean,
-    useFieldId: Boolean) extends FilePartitionReaderBase(conf, execMetrics)
+    useFieldId: Boolean,
+    override val preserveDictionaryEncoding: Boolean = false,
+    override val dictionaryOutputColumns: Option[Seq[String]] = None) extends FilePartitionReaderBase(conf, execMetrics)
   with ParquetPartitionReaderBase {
 
   private val blockIterator:  BufferedIterator[BlockMetaData] = clippedBlocks.iterator.buffered
@@ -3299,71 +3337,4 @@ object ParquetPartitionReader {
 }
 
 // TODO: Re-enable when ParquetHybridScan JNI is available
-/**
- * A PartitionReaderFactory for cuDF Hybrid Scan.
- * 
- * This factory creates readers that use the two-pass hybrid scan approach:
- * 1. First pass: Read filter columns and build row mask
- * 2. Second pass: Read payload columns using row mask for optimal I/O
- */
-case class GpuParquetHybridScanPartitionReaderFactory(
-    @transient sqlConf: SQLConf,
-    broadcastedConf: Broadcast[SerializableConfiguration],
-    dataSchema: StructType,
-    readDataSchema: StructType,
-    partitionSchema: StructType,
-    filters: Array[Filter],
-    @transient rapidsConf: RapidsConf,
-    metrics: Map[String, GpuMetric],
-    @transient params: Map[String, String],
-    filterColumns: Array[String],
-    payloadColumns: Array[String],
-    dataFilters: Seq[Expression])
-  extends ShimFilePartitionReaderFactory(params) with Logging {
-
-  // Extract configuration values in constructor before serialization
-  private val usePageIndex = rapidsConf.cudfHybridScanUsePageIndex
-  private val useBloomFilter = rapidsConf.cudfHybridScanUseBloomFilter
-  private val parallelIOEnabled = rapidsConf.cudfHybridScanParallelIOEnabled
-  private val numIOThreads = rapidsConf.cudfHybridScanParallelIONumThreads
-  private val maxRowGroupsParallel = rapidsConf.cudfHybridScanMaxRowGroupsParallel
-  private val selectivityThreshold = rapidsConf.cudfHybridScanSelectivityThreshold
-  private val pipeliningEnabled = rapidsConf.cudfHybridScanPipeliningEnabled
-
-  override def buildReader(partitionedFile: PartitionedFile): PartitionReader[InternalRow] = {
-    throw new IllegalStateException("GPU column parser called to read rows")
-  }
-
-  override def buildColumnarReader(
-      partitionedFile: PartitionedFile): PartitionReader[ColumnarBatch] = {
-    
-    val hadoopConf = broadcastedConf.value.value
-    val filePath = new Path(new URI(partitionedFile.filePath.toString()))
-
-    logInfo(s"Creating cuDF Hybrid Scan reader for ${filePath}")
-    logDebug(s"Filter columns: [${filterColumns.mkString(", ")}]")
-    logDebug(s"Payload columns: [${payloadColumns.mkString(", ")}]")
-
-    // Create the hybrid scan partition reader with extracted config values
-    // Now passing dataFilters to enable filter expression conversion
-    new CudfHybridScanPartitionReader(
-      hadoopConf,
-      partitionedFile,
-      filePath,
-      readDataSchema,
-      filterColumns,
-      payloadColumns,
-      usePageIndex,
-      useBloomFilter,
-      parallelIOEnabled,
-      numIOThreads,
-      maxRowGroupsParallel,
-      selectivityThreshold,
-      pipeliningEnabled,
-      metrics,
-      dataFilters  // Pass dataFilters for filter expression conversion
-    )
-  }
-
-  override def supportColumnarReads(partition: InputPartition): Boolean = true
-}
+// GpuParquetHybridScanPartitionReaderFactory disabled - ParquetHybridScan not available
