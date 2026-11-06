@@ -29,10 +29,10 @@ import org.apache.spark.sql.execution.{SparkPlan, SparkStrategy}
 class StrategyRules extends SparkStrategy {
 
   private lazy val strategies: Seq[SparkStrategy] = {
-    // Currently we only have custom plan nodes that originate from
-    // DeltaLake, but if we add other custom plan nodes later
-    // their strategies can be appended here.
-    DeltaProvider().getStrategyRules
+    // Preserve Delta's first-fit strategies before considering ordinary inner joins.
+    DeltaProvider().getStrategyRules ++ Seq(
+      new GpuDimensionBridgeJoinStrategy, new GpuMinMaxPreJoinStrategy,
+      new GpuCountPreJoinStrategy)
   }
 
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = {

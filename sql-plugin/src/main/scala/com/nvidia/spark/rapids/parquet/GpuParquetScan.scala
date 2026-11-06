@@ -45,7 +45,7 @@ import com.nvidia.spark.rapids.jni.fileio.{RapidsFileIO, RapidsInputFile}
 import com.nvidia.spark.rapids.jni.fileio.RapidsInputFile.CopyRange
 import com.nvidia.spark.rapids.parquet.ParquetPartitionReader.{LocalCopy, PARQUET_MAGIC}
 import com.nvidia.spark.rapids.shims.{ColumnDefaultValuesShims, GpuParquetCrypto, GpuTypeShims, ShimFilePartitionReaderFactory, SparkShimImpl}
-import com.nvidia.spark.rapids.shims.parquet.{GpuParquetUtilsShims, ParquetLegacyNanoAsLongShims, ParquetSchemaClipShims, ParquetStringPredShims}
+import com.nvidia.spark.rapids.shims.parquet.{GpuParquetUtilsShims, ParquetFooterReader, ParquetLegacyNanoAsLongShims, ParquetSchemaClipShims, ParquetStringPredShims}
 import org.apache.commons.io.output.{CountingOutputStream, NullOutputStream}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
@@ -494,6 +494,8 @@ protected case class GpuParquetFileFilterHandler(
     @transient sqlConf: SQLConf,
     metrics: Map[String, GpuMetric]) extends Logging {
 
+  @transient private lazy val footerReaderShim = new ParquetFooterReader
+
   private val FOOTER_LENGTH_SIZE = 4
   private val isCaseSensitive = sqlConf.caseSensitiveAnalysis
   private val enableParquetFilterPushDown: Boolean = sqlConf.parquetFilterPushDown
@@ -656,9 +658,6 @@ protected case class GpuParquetFileFilterHandler(
     }
   }
 
-  @scala.annotation.nowarn(
-    "msg=method readFooter in class ParquetFileReader is deprecated"
-  )
   private def readAndSimpleFilterFooter(
       fileIO: RapidsFileIO,
       file: PartitionedFile,
@@ -669,7 +668,7 @@ protected case class GpuParquetFileFilterHandler(
       val inputFile = fileIO.newInputFile(filePath)
       withResource(ParquetFooterUtils.getFooterBuffer(inputFile, metrics,
           readFooterBuffer(fileIO, filePath, conf))) { hmb =>
-        ParquetFileReader.readFooter(new HMBInputFile(hmb),
+        footerReaderShim.readFooter(new HMBInputFile(hmb),
           ParquetMetadataConverter.range(file.start, file.start + file.length))
       }
     }
@@ -721,7 +720,7 @@ protected case class GpuParquetFileFilterHandler(
                 val inputFile = new HMBInputFile(serialized)
 
                 // We already filtered the ranges so no need to do more here...
-                ParquetFileReader.readFooter(inputFile, ParquetMetadataConverter.NO_FILTER)
+                footerReaderShim.readFooter(inputFile, ParquetMetadataConverter.NO_FILTER)
               }
             }
             // Fix up row index offsets. ParquetFileReader.readFooter computes row

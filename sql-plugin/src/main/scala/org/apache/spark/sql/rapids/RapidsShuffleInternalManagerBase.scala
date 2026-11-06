@@ -32,9 +32,9 @@ import com.nvidia.spark.rapids.RapidsConf
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.ScalableTaskCompletion.onTaskCompletion
 import com.nvidia.spark.rapids.format.TableMeta
-import com.nvidia.spark.rapids.jni.kudo.OpenByteArrayOutputStream
 import com.nvidia.spark.rapids.shuffle.{RapidsShuffleRequestHandler, RapidsShuffleServer, RapidsShuffleTransport}
 import com.nvidia.spark.rapids.spill.SpillablePartialFileHandle
+import org.apache.commons.io.output.UnsynchronizedByteArrayOutputStream
 
 import org.apache.spark.{InterruptibleIterator, MapOutputTracker, ShuffleDependency, SparkConf, SparkEnv, TaskContext}
 import org.apache.spark.executor.ShuffleWriteMetrics
@@ -314,7 +314,7 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
    * @param remainingQuota The quota to release after writing to disk
    */
   private case class CompressedRecord(
-    buffer: OpenByteArrayOutputStream,
+    buffer: UnsynchronizedByteArrayOutputStream,
     compressedSize: Long,
     remainingQuota: Long)
 
@@ -451,7 +451,7 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
 
     private def writeRecord(record: CompressedRecord): Unit = {
       if (record.compressedSize > 0) {
-        outputStream.write(record.buffer.getBuf, 0, record.compressedSize.toInt)
+        record.buffer.writeTo(outputStream)
       }
       record.buffer.close()
       limiter.release(record.remainingQuota)
@@ -610,7 +610,7 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
    * Data flow for each record:
    * 1. ColumnarBatch (already copied to host memory, may be split from GPU batches based on
    *    spark.rapids.shuffle.partitioning.maxCpuBatchSize) -> Main thread acquires limiter quota
-   * 2. Writer thread: serialize + compress -> OpenByteArrayOutputStream (JVM heap)
+   * 2. Writer thread: serialize + compress -> segmented byte buffers (JVM heap)
    * 3. Writer thread: release excess quota (recordSize - compressedSize)
    * 4. Merger step: heap buffer -> ShuffleMapOutputWriter (via SpillablePartialFileHandle)
    *    - If MEMORY_WITH_SPILL mode: data may stay in host memory until spill/commit
@@ -727,7 +727,9 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
               withResource(cb) { _ =>
                 // Create a new buffer for this record.
                 // The buffer is closed by the merger thread after writing to disk.
-                val buffer = new OpenByteArrayOutputStream()
+                // Keep completed segments when growing instead of copying the entire record.
+                // Each record has one writer, then ownership transfers to the merger.
+                val buffer = new UnsynchronizedByteArrayOutputStream()
 
                 // Serialize + compress + encryption to memory buffer
                 val compressedOutputStream = blockManager.serializerManager.wrapStream(
@@ -741,11 +743,11 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
                 }
 
                 // Track total written data size (compressed size)
-                val compressedSize = buffer.getCount.toLong
+                val compressedSize = buffer.size().toLong
                 totalCompressedSize.addAndGet(compressedSize)
 
                 // Release excess quota immediately after compression.
-                // Data is now in OpenByteArrayOutputStream (heap), only need to hold
+                // Data is now in segmented byte buffers (heap), only need to hold
                 // compressedSize quota until Merger writes to disk.
                 // Note: excessQuota can be 0 if compression doesn't reduce size (or expands)
                 val excessQuota = math.max(0L, recordSize - compressedSize)

@@ -18,7 +18,7 @@ package com.nvidia.spark.rapids.spill
 
 import java.io.{BufferedInputStream, BufferedOutputStream, File, FileInputStream, FileOutputStream, IOException, RandomAccessFile}
 import java.nio.ByteBuffer
-import java.nio.channels.FileChannel
+import java.nio.channels.{FileChannel, WritableByteChannel}
 
 import ai.rapids.cudf.HostMemoryBuffer
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
@@ -532,6 +532,38 @@ class SpillablePartialFileHandle private (
       val raf = new RandomAccessFile(file, "r")
       randomAccessFile = Some(raf)
       fileChannel = Some(raf.getChannel)
+    }
+  }
+
+  /**
+   * Make one non-blocking write attempt without staging native memory through a heap array.
+   * Keep the memory view protected from a concurrent spill until the channel write returns.
+   * A zero-byte write is backpressure; the caller must return to the transport event loop.
+   */
+  def transferTo(position: Long, length: Int, target: WritableByteChannel): Long = synchronized {
+    require(writeFinished && !closed, "Cannot transfer an unfinished or closed partial file")
+    require(position >= 0 && length >= 0, "Invalid partial-file transfer range")
+    if (length == 0) {
+      0L
+    } else if (position >= totalBytesWritten) {
+      throw new IOException(s"Unexpected EOF transferring partial file at $position")
+    } else {
+      val count = SpillablePartialFileHandle.boundedReadLengthAsInt(
+        length, totalBytesWritten - position)
+      if (shouldUseFile) {
+        ensureFileChannelOpen()
+        val channel = fileChannel.get
+        val written = channel.transferTo(position, count, target)
+        if (written == 0 && channel.size() <= position) {
+          throw new IOException(s"Truncated partial file at $position")
+        }
+        written
+      } else {
+        val buffer = host.getOrElse {
+          throw new IllegalStateException("Host buffer is missing before spill")
+        }
+        target.write(buffer.asByteBuffer(position, count)).toLong
+      }
     }
   }
 

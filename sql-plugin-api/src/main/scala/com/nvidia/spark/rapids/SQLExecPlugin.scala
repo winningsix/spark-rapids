@@ -32,6 +32,14 @@ class SQLExecPlugin extends (SparkSessionExtensions => Unit) {
     extensions.injectQueryStagePrepRule(queryStagePrepOverrides)
     extensions.injectPlannerStrategy(_ => strategyRules)
     extensions.injectPostHocResolutionRule(postHocResolutionOverrides)
+    extensions.injectPostHocResolutionRule(ShimLoader.newGpuScalarAggregateSharingOverrides)
+    extensions.injectOptimizerRule(ShimLoader.newGpuSelfJoinExistsOverrides)
+    extensions.injectOptimizerRule(ShimLoader.newGpuMultiKeySemiJoinDistinctOverrides)
+    extensions.injectRuntimeOptimizerRule(ShimLoader.newGpuAqeGroupingStatistics)
+    extensions.injectOptimizerRule(ShimLoader.newGpuAggregateFusionOverrides)
+    extensions.injectOptimizerRule(ShimLoader.newGpuRollupRankPruningOverrides)
+    extensions.injectOptimizerRule(ShimLoader.newGpuOrderedAggregatePrefixOverrides)
+    extensions.injectOptimizerRule(ShimLoader.newGpuOuterAggregatePrefixOverrides)
   }
 
   private def columnarOverrides(sparkSession: SparkSession): ColumnarRule = {

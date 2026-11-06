@@ -385,9 +385,9 @@ class MultiSegmentInputStream(segments: Seq[PartitionSegment]) extends InputStre
 /**
  * A FileRegion implementation that streams data from multiple partition segments.
  *
- * This class enables network transfer of shuffle data by reading from segments
- * via readAt() and writing to the target channel. Data is read in chunks (64KB)
- * to limit memory usage during transfer.
+ * This class transfers native memory or file segments directly to the target channel.
+ * Each attempt is bounded and returns on socket backpressure so the Netty event loop
+ * can service other connections instead of spinning on a zero-byte write.
  *
  * Spark's MessageWithHeader only accepts ByteBuf or FileRegion. By implementing
  * FileRegion, we can provide streaming transfer while remaining compatible with
@@ -400,9 +400,6 @@ class MultiSegmentFileRegion(segments: Seq[PartitionSegment]) extends AbstractFi
 
   // Buffer size for each transferTo call (64KB chunks)
   private val CHUNK_SIZE = 64 * 1024
-
-  // Reusable buffer for reading data (avoids allocation per transferTo call)
-  private val readBuffer = new Array[Byte](CHUNK_SIZE)
 
   // Track current position within the logical data stream
   private var currentSegmentIndex: Int = 0
@@ -417,8 +414,8 @@ class MultiSegmentFileRegion(segments: Seq[PartitionSegment]) extends AbstractFi
   /**
    * Transfer data to the target channel in chunks.
    *
-   * This method reads data from segments using readAt() and writes to the channel.
-   * Each call transfers up to CHUNK_SIZE bytes.
+   * Each call attempts to transfer up to CHUNK_SIZE bytes. Partial and zero-byte
+   * writes are returned immediately; the next invocation resumes at the actual offset.
    *
    * @param target the channel to write data to
    * @param position the current transfer position (should equal totalTransferred)
@@ -444,30 +441,15 @@ class MultiSegmentFileRegion(segments: Seq[PartitionSegment]) extends AbstractFi
         currentSegmentIndex += 1
         bytesTransferredInCurrentSegment = 0
       } else {
-        // Read from current segment using readAt
-        val toRead = math.min(remainingInSegment, CHUNK_SIZE).toInt
+        val toWrite = math.min(remainingInSegment, CHUNK_SIZE).toInt
         val handlePosition = segment.offset + bytesTransferredInCurrentSegment
-        val bytesRead = segment.handle.readAt(handlePosition, readBuffer, 0, toRead)
-
-        if (bytesRead > 0) {
-          // Write to target channel
-          val writeBuffer = ByteBuffer.wrap(readBuffer, 0, bytesRead)
-          var written = 0
-          while (writeBuffer.hasRemaining) {
-            val w = target.write(writeBuffer)
-            if (w < 0) {
-              throw new IOException("Failed to write to target channel")
-            }
-            written += w
-          }
-
-          bytesTransferredInCurrentSegment += written
-          totalTransferred += written
-          return written
-        } else if (bytesRead < 0) {
-          throw new IOException(
-            s"Unexpected EOF reading segment at position $handlePosition")
+        val written = segment.handle.transferTo(handlePosition, toWrite, target)
+        if (written < 0 || written > toWrite) {
+          throw new IOException(s"Invalid shuffle transfer byte count: $written")
         }
+        bytesTransferredInCurrentSegment += written
+        totalTransferred += written
+        return written
       }
     }
 

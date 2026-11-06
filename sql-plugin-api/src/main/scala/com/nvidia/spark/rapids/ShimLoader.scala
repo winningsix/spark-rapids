@@ -363,6 +363,55 @@ object ShimLoader {
     ShimReflectionUtils.newInstanceOf("com.nvidia.spark.udf.LogicalPlanRules")
   }
 
+  def newGpuAqeGroupingStatistics(ss: SparkSession): Rule[LogicalPlan] = {
+    val clazz = ShimReflectionUtils.loadClass("com.nvidia.spark.rapids.GpuAqeGroupingStatistics")
+    clazz.getConstructor(classOf[SparkSession]).newInstance(ss).asInstanceOf[Rule[LogicalPlan]]
+  }
+
+  def newGpuSelfJoinExistsOverrides(ss: SparkSession): Rule[LogicalPlan] = {
+    val clz = ShimReflectionUtils.loadClass(
+      "com.nvidia.spark.rapids.GpuSelfJoinExistsOverrides")
+    val constructor = clz.getConstructor(classOf[SparkSession])
+    constructor.newInstance(ss).asInstanceOf[Rule[LogicalPlan]]
+  }
+
+  def newGpuMultiKeySemiJoinDistinctOverrides(ss: SparkSession): Rule[LogicalPlan] = {
+    val clz = ShimReflectionUtils.loadClass(
+      "com.nvidia.spark.rapids.GpuMultiKeySemiJoinDistinctOverrides")
+    clz.getConstructor(classOf[SparkSession]).newInstance(ss).asInstanceOf[Rule[LogicalPlan]]
+  }
+
+  def newGpuRollupRankPruningOverrides(ss: SparkSession): Rule[LogicalPlan] = {
+    val cls = ShimReflectionUtils.loadClass(
+      "com.nvidia.spark.rapids.GpuRollupRankPruningOverrides")
+    cls.getConstructor(classOf[SparkSession]).newInstance(ss).asInstanceOf[Rule[LogicalPlan]]
+  }
+
+  def newGpuScalarAggregateSharingOverrides(ss: SparkSession): Rule[LogicalPlan] = {
+    val cls = ShimReflectionUtils.loadClass(
+      "com.nvidia.spark.rapids.GpuScalarAggregateSharingOverrides")
+    cls.getConstructor(classOf[SparkSession]).newInstance(ss).asInstanceOf[Rule[LogicalPlan]]
+  }
+
+  def newGpuAggregateFusionOverrides(ss: SparkSession): Rule[LogicalPlan] = {
+    val clz = ShimReflectionUtils.loadClass(
+      "com.nvidia.spark.rapids.GpuAggregateFusionOverrides")
+    val constructor = clz.getConstructor(classOf[SparkSession])
+    constructor.newInstance(ss).asInstanceOf[Rule[LogicalPlan]]
+  }
+
+  def newGpuOrderedAggregatePrefixOverrides(ss: SparkSession): Rule[LogicalPlan] = {
+    val cls = ShimReflectionUtils.loadClass(
+      "com.nvidia.spark.rapids.GpuOrderedAggregatePrefixOverrides")
+    cls.getConstructor(classOf[SparkSession]).newInstance(ss).asInstanceOf[Rule[LogicalPlan]]
+  }
+
+  def newGpuOuterAggregatePrefixOverrides(ss: SparkSession): Rule[LogicalPlan] = {
+    val cls = ShimReflectionUtils.loadClass(
+      "com.nvidia.spark.rapids.GpuOuterAggregatePrefixOverrides")
+    cls.getConstructor(classOf[SparkSession]).newInstance(ss).asInstanceOf[Rule[LogicalPlan]]
+  }
+
   def newStrategyRules(): SparkStrategy = {
     ShimReflectionUtils.newInstanceOf("com.nvidia.spark.rapids.StrategyRules")
   }

@@ -1389,7 +1389,7 @@ abstract class GpuBaseAggregateMeta[INPUT <: SparkPlan](
       canUsePartialSortAgg &&
       groupingCanBeSorted
 
-    GpuHashAggregateExec(
+    val gpuAggregate = GpuHashAggregateExec(
       aggRequiredChildDistributionExpressions,
       gpuGroupingExpressions,
       gpuAggregateExpressions,
@@ -1403,6 +1403,7 @@ abstract class GpuBaseAggregateMeta[INPUT <: SparkPlan](
       allowNonFullyAggregatedOutput,
       conf.skipAggPassReductionRatio
     )
+    GpuHierarchicalRollupAggregateExec.tryReplace(gpuAggregate)
   }
 }
 
