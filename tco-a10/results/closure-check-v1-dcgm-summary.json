@@ -1,0 +1,210 @@
+{
+ "closure-check-v1-closure_b2-evidence": {
+  "samples": 2185,
+  "gpu_util_pct": 29.27963386727689,
+  "sm_active": 0.1560183066361556,
+  "sm_occupancy": 0.10352402745995423,
+  "dram_active": 0.09726864988558352,
+  "pcie_tx_MBps": 470.2410640915332,
+  "pcie_rx_MBps": 1153.3538881661327,
+  "power_W": 114.67566544622426,
+  "frac_samples_gpu_idle": 0.5148741418764302,
+  "frac_samples_smact_ge_0_5": 0.10251716247139588,
+  "per_gpu_sm_active": {
+   "0": 0.1543308957952468,
+   "1": 0.15678976234003655,
+   "2": 0.15676556776556777,
+   "3": 0.15618899082568807
+  },
+  "longest_queries": [
+   {
+    "query": "query4",
+    "samples": 72,
+    "sm_active": 0.252,
+    "sm_occ": 0.149,
+    "gpu_util": 34.2
+   },
+   {
+    "query": "query75",
+    "samples": 64,
+    "sm_active": 0.128,
+    "sm_occ": 0.086,
+    "gpu_util": 42.5
+   },
+   {
+    "query": "query64",
+    "samples": 64,
+    "sm_active": 0.151,
+    "sm_occ": 0.104,
+    "gpu_util": 35.1
+   },
+   {
+    "query": "query23_part1",
+    "samples": 64,
+    "sm_active": 0.504,
+    "sm_occ": 0.321,
+    "gpu_util": 64.2
+   },
+   {
+    "query": "query23_part2",
+    "samples": 64,
+    "sm_active": 0.489,
+    "sm_occ": 0.312,
+    "gpu_util": 59.6
+   },
+   {
+    "query": "query67",
+    "samples": 62,
+    "sm_active": 0.446,
+    "sm_occ": 0.296,
+    "gpu_util": 51.0
+   },
+   {
+    "query": "query14_part1",
+    "samples": 56,
+    "sm_active": 0.245,
+    "sm_occ": 0.164,
+    "gpu_util": 36.0
+   },
+   {
+    "query": "query72",
+    "samples": 52,
+    "sm_active": 0.2,
+    "sm_occ": 0.147,
+    "gpu_util": 54.7
+   },
+   {
+    "query": "query24_part1",
+    "samples": 52,
+    "sm_active": 0.156,
+    "sm_occ": 0.114,
+    "gpu_util": 36.3
+   },
+   {
+    "query": "query24_part2",
+    "samples": 52,
+    "sm_active": 0.153,
+    "sm_occ": 0.112,
+    "gpu_util": 27.8
+   },
+   {
+    "query": "query78",
+    "samples": 51,
+    "sm_active": 0.178,
+    "sm_occ": 0.13,
+    "gpu_util": 29.5
+   },
+   {
+    "query": "query16",
+    "samples": 48,
+    "sm_active": 0.192,
+    "sm_occ": 0.123,
+    "gpu_util": 59.9
+   }
+  ]
+ },
+ "closure-check-v1-baseline_a3-evidence": {
+  "samples": 2301,
+  "gpu_util_pct": 29.681877444589308,
+  "sm_active": 0.1551638418079096,
+  "sm_occupancy": 0.10325076053889613,
+  "dram_active": 0.09699478487614081,
+  "pcie_tx_MBps": 470.1898825097784,
+  "pcie_rx_MBps": 1160.6166783050846,
+  "power_W": 115.23031594958714,
+  "frac_samples_gpu_idle": 0.5032594524119948,
+  "frac_samples_smact_ge_0_5": 0.09734897870491091,
+  "per_gpu_sm_active": {
+   "0": 0.15385217391304348,
+   "1": 0.15495130434782609,
+   "2": 0.15565104166666666,
+   "3": 0.1562
+  },
+  "longest_queries": [
+   {
+    "query": "query4",
+    "samples": 84,
+    "sm_active": 0.231,
+    "sm_occ": 0.139,
+    "gpu_util": 34.8
+   },
+   {
+    "query": "query75",
+    "samples": 72,
+    "sm_active": 0.135,
+    "sm_occ": 0.089,
+    "gpu_util": 39.2
+   },
+   {
+    "query": "query64",
+    "samples": 72,
+    "sm_active": 0.135,
+    "sm_occ": 0.093,
+    "gpu_util": 27.0
+   },
+   {
+    "query": "query23_part2",
+    "samples": 72,
+    "sm_active": 0.437,
+    "sm_occ": 0.28,
+    "gpu_util": 59.5
+   },
+   {
+    "query": "query67",
+    "samples": 68,
+    "sm_active": 0.418,
+    "sm_occ": 0.276,
+    "gpu_util": 47.9
+   },
+   {
+    "query": "query23_part1",
+    "samples": 68,
+    "sm_active": 0.52,
+    "sm_occ": 0.333,
+    "gpu_util": 56.8
+   },
+   {
+    "query": "query14_part1",
+    "samples": 60,
+    "sm_active": 0.254,
+    "sm_occ": 0.172,
+    "gpu_util": 47.1
+   },
+   {
+    "query": "query78",
+    "samples": 52,
+    "sm_active": 0.194,
+    "sm_occ": 0.139,
+    "gpu_util": 26.2
+   },
+   {
+    "query": "query14_part2",
+    "samples": 52,
+    "sm_active": 0.283,
+    "sm_occ": 0.196,
+    "gpu_util": 35.3
+   },
+   {
+    "query": "query72",
+    "samples": 52,
+    "sm_active": 0.201,
+    "sm_occ": 0.149,
+    "gpu_util": 41.9
+   },
+   {
+    "query": "query11",
+    "samples": 48,
+    "sm_active": 0.257,
+    "sm_occ": 0.149,
+    "gpu_util": 37.7
+   },
+   {
+    "query": "query24_part1",
+    "samples": 48,
+    "sm_active": 0.138,
+    "sm_occ": 0.101,
+    "gpu_util": 45.2
+   }
+  ]
+ }
+}

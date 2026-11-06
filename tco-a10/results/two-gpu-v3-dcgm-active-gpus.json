@@ -1,0 +1,70 @@
+{
+ "base": {
+  "0": {
+   "gpu_util": 0.0,
+   "sm_active": 0.0,
+   "sm_occ": 0.0,
+   "dram": 0.0,
+   "power": 98.3496,
+   "idle": 1.0
+  },
+  "1": {
+   "gpu_util": 0.0,
+   "sm_active": 0.0,
+   "sm_occ": 0.0,
+   "dram": 0.0,
+   "power": 95.3927,
+   "idle": 1.0
+  },
+  "2": {
+   "gpu_util": 45.0428,
+   "sm_active": 0.2624,
+   "sm_occ": 0.1754,
+   "dram": 0.1658,
+   "power": 129.2126,
+   "idle": 0.377
+  },
+  "3": {
+   "gpu_util": 45.9853,
+   "sm_active": 0.2661,
+   "sm_occ": 0.1777,
+   "dram": 0.1679,
+   "power": 126.1972,
+   "idle": 0.364
+  }
+ },
+ "closure": {
+  "0": {
+   "gpu_util": 0.0,
+   "sm_active": 0.0,
+   "sm_occ": 0.0,
+   "dram": 0.0,
+   "power": 98.3777,
+   "idle": 1.0
+  },
+  "1": {
+   "gpu_util": 0.0,
+   "sm_active": 0.0,
+   "sm_occ": 0.0,
+   "dram": 0.0,
+   "power": 95.3962,
+   "idle": 1.0
+  },
+  "2": {
+   "gpu_util": 46.1172,
+   "sm_active": 0.2723,
+   "sm_occ": 0.1819,
+   "dram": 0.1719,
+   "power": 129.5431,
+   "idle": 0.358
+  },
+  "3": {
+   "gpu_util": 46.0163,
+   "sm_active": 0.2714,
+   "sm_occ": 0.1814,
+   "dram": 0.1709,
+   "power": 126.0251,
+   "idle": 0.371
+  }
+ }
+}
