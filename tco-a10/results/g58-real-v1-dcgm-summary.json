@@ -1,0 +1,103 @@
+{
+ "<workspace>/g58-real-v1-one_gpu-evidence": {
+  "samples": 1159,
+  "gpu_util_pct": 60.03537532355479,
+  "sm_active": 0.3895591026747196,
+  "sm_occupancy": 0.25815875754961176,
+  "dram_active": 0.24320448662640207,
+  "pcie_tx_MBps": 1073.942569350302,
+  "pcie_rx_MBps": 2967.2571445547887,
+  "power_W": 141.0768981880932,
+  "frac_samples_gpu_idle": 0.22605694564279552,
+  "frac_samples_smact_ge_0_5": 0.38654012079378774,
+  "per_gpu_sm_active": {
+   "0": 0.3895591026747196
+  },
+  "longest_queries": [
+   {
+    "query": "query23_part1",
+    "samples": 48,
+    "sm_active": 0.76,
+    "sm_occ": 0.484,
+    "gpu_util": 86.1
+   },
+   {
+    "query": "query23_part2",
+    "samples": 48,
+    "sm_active": 0.76,
+    "sm_occ": 0.484,
+    "gpu_util": 87.4
+   },
+   {
+    "query": "query67",
+    "samples": 43,
+    "sm_active": 0.704,
+    "sm_occ": 0.473,
+    "gpu_util": 80.5
+   },
+   {
+    "query": "query4",
+    "samples": 39,
+    "sm_active": 0.398,
+    "sm_occ": 0.267,
+    "gpu_util": 66.2
+   },
+   {
+    "query": "query75",
+    "samples": 33,
+    "sm_active": 0.339,
+    "sm_occ": 0.229,
+    "gpu_util": 80.7
+   },
+   {
+    "query": "query14_part1",
+    "samples": 31,
+    "sm_active": 0.534,
+    "sm_occ": 0.371,
+    "gpu_util": 68.3
+   },
+   {
+    "query": "query64",
+    "samples": 30,
+    "sm_active": 0.325,
+    "sm_occ": 0.228,
+    "gpu_util": 64.8
+   },
+   {
+    "query": "query28",
+    "samples": 30,
+    "sm_active": 0.602,
+    "sm_occ": 0.458,
+    "gpu_util": 76.6
+   },
+   {
+    "query": "query16",
+    "samples": 29,
+    "sm_active": 0.457,
+    "sm_occ": 0.239,
+    "gpu_util": 72.3
+   },
+   {
+    "query": "query24_part1",
+    "samples": 29,
+    "sm_active": 0.282,
+    "sm_occ": 0.212,
+    "gpu_util": 65.3
+   },
+   {
+    "query": "query24_part2",
+    "samples": 29,
+    "sm_active": 0.282,
+    "sm_occ": 0.212,
+    "gpu_util": 69.3
+   },
+   {
+    "query": "query14_part2",
+    "samples": 28,
+    "sm_active": 0.545,
+    "sm_occ": 0.38,
+    "gpu_util": 67.7
+   }
+  ]
+ }
+}

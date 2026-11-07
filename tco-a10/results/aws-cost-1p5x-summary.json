@@ -1,0 +1,36 @@
+{
+  "goal": "AWS cost per run down 1.5x vs g5.24xlarge 4GPU+closure ($8.144/h x 184.33 s = $0.417); raise GPU utilization",
+  "result": "met on real g5.8xlarge (1x A10G, 32 vCPU, $2.448/h)",
+  "real_g58": {
+    "evidence": "g58-real-v1-one_gpu-evidence",
+    "archive_sha256": "f121c72924f8bb64249b477589c9a12e52c5f5fe2378ccb140b1ea334b12d919",
+    "jar": "rapids-confcache-spark402-v1.jar (a646fda9...) + closure overlay",
+    "harness": "run_benchmark_executors_v1.py (standard)",
+    "sum_medians_s": 383.75,
+    "records_ok": 412,
+    "answers": "equal to reference",
+    "executor_count": 1,
+    "oom": 0,
+    "cost_usd_per_run": 0.261,
+    "cost_reduction_x": 1.598,
+    "dcgm": {
+      "gpu_util_pct": 60.0,
+      "sm_active": 0.39,
+      "sm_occupancy": 0.258,
+      "dram_active": 0.243,
+      "idle_frac": 0.226
+    }
+  },
+  "emulated_g58_light_harness_s": 371.86,
+  "baseline_4gpu_dcgm": {
+    "gpu_util_pct": 29,
+    "sm_active": 0.156,
+    "idle_frac": 0.51
+  },
+  "confcache": "Hadoop conf broadcast cache keyed by SHA-256 of conf; ~4.5-5% on 10 heavy queries (48-vCPU shape); full-103 ABBA pending",
+  "rejected": [
+    "g5.12xlarge (CPU-bound, 4 GPUs at 48 vCPU)",
+    "shuffle compression off",
+    "shuffle threads 8"
+  ]
+}

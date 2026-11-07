@@ -43,7 +43,6 @@ import org.apache.spark.sql.execution.rapids.shims.FilePartitionShims
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.ColumnarBatch
-import org.apache.spark.util.SerializableConfiguration
 import org.apache.spark.util.collection.BitSet
 
 /**
@@ -625,7 +624,7 @@ case class GpuFileSourceScanExec(
       hadoopConf.setBoolean("rapids.sql.scan.prefetch", prefetchEagerly)
     }
     val broadcastedHadoopConf =
-      relation.sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
+      GpuHadoopConfBroadcastCache.broadcast(relation.sparkSession.sparkContext, hadoopConf)
     gpuFormat.createMultiFileReaderFactory(
       broadcastedHadoopConf,
       pushedDownFilters.toArray,

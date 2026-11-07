@@ -77,3 +77,36 @@ Caveat: in 99 of the 103 queries, the Gluten stream used different query literal
 
 The "later best JAR" rows come from a chain of class-level overlays built on top
 of this source. Those overlays are not yet part of this branch's source.
+
+## AWS cost per run: 1 GPU on g5.8xlarge (goal: 1.5x lower than 4 GPU)
+
+Measured on a real g5.8xlarge (1x A10G, 32 vCPU, 128 GiB), with 1 executor x 10 cores,
+the Hadoop-conf broadcast cache below and the closure-check overlay. Standard harness,
+same protocol as the 4-GPU baseline. us-east-1 on-demand prices.
+
+| Metric | Baseline: g5.24xlarge, 4 GPU | g5.8xlarge, 1 GPU |
+|---|---|---|
+| Price per hour | $8.144 | $2.448 |
+| Sum of medians, 103 queries | 184.33 s | 383.75 s |
+| **Cost per run** | **$0.417** | **$0.261 (1.60x lower)** |
+| GPU util | 29% | **60%** |
+| SM active | 0.156 | **0.39** |
+| Samples fully idle | 51% | **23%** |
+
+412/412 records OK, answers equal to the reference, 1 executor throughout, no OOM.
+About 123 s per run is driver/CPU time that does not shrink with more GPUs
+(T ~ 123 s + 244 s / nGPU), so one fully used GPU costs less per run than four
+mostly idle ones. A g5.12xlarge (4 GPU, 48 vCPU) is CPU-bound and was rejected.
+
+### Hadoop-conf broadcast cache
+
+`GpuFileSourceScanExec.readerFactory` used to broadcast the full Hadoop
+`Configuration` on every scan execution (about 87 ms per execution on heavy queries).
+`GpuHadoopConfBroadcastCache` reuses the broadcast when the conf contents (SHA-256 of
+all entries) and the SparkContext are the same. Disable it with
+`spark.rapids.sql.scan.hadoopConfBroadcastCache.enabled=false`. On the 10 heaviest
+queries at 48 vCPU it was about 4.5-5% faster (59.66 s -> 56.95/56.24/56.28 s).
+A full 103-query ABBA has not been run yet.
+
+Files: `harness/scripts/run-cgroup-shape-v1.py`, `harness/config/g58-*-protocol.json`,
+`results/g58-real-v1-*`, `results/aws-cost-1p5x-summary.json`.

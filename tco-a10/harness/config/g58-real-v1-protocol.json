@@ -1,0 +1,14 @@
+{
+ "name": "g58-real-v1",
+ "purpose": "Real AWS g5.8xlarge (1x A10G, 32 vCPU, 128 GiB, $2.448/h us-east-1): full 103 queries, standard harness (same protocol as the 184.33 s 4-GPU baseline). cgroup only groups processes for sampling (all CPUs, no memory cap).",
+ "connection": "connection-g58.json",
+ "queries": "all",
+ "memory_max": "max",
+ "cpus": "0-31",
+ "daemons": 2,
+ "executors": 1,
+ "arms": [
+  {"name": "one_gpu", "jar": "rapids-confcache-spark402-v1.jar", "closure_overlay": true,
+   "conf": {"spark.cores.max": "10", "spark.executor.instances": "1"}}
+ ]
+}

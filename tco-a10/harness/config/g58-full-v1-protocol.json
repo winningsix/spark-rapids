@@ -1,0 +1,14 @@
+{
+ "name": "g58-full-v1",
+ "purpose": "g5.8xlarge shape (1 A10G, 32 vCPU = cores 0-15 + siblings, 124G cgroup incl. page cache), 1 executor x 10 cores; full 103 queries, light harness. Cost candidate: $2.448/h.",
+ "queries": "all",
+ "memory_max": "124G",
+ "cpus": "0-15,48-63",
+ "executors": 1,
+ "harness": "run_benchmark_light_v1.py",
+ "harness_args": ["--audit-iterations", "first"],
+ "arms": [
+  {"name": "one_gpu", "jar": "rapids-confcache-spark402-v1.jar", "closure_overlay": true,
+   "conf": {"spark.cores.max": "10", "spark.executor.instances": "1"}}
+ ]
+}
